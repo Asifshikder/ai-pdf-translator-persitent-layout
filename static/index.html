@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Translator — English to Bangla</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; margin: 0; background: #f4f5f7; color: #1a1a1a;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16181d; color: #e8e8e8; }
+    .card { background: #1f232b !important; }
+    #drop { border-color: #444 !important; }
+  }
+  .card {
+    background: #fff; border-radius: 12px; padding: 2rem;
+    width: min(480px, 92vw); box-shadow: 0 4px 24px rgba(0,0,0,.08);
+  }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  p.sub { margin: 0 0 1.25rem; opacity: .7; font-size: .9rem; }
+  #drop {
+    border: 2px dashed #bbb; border-radius: 10px; padding: 2rem 1rem;
+    text-align: center; cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  #drop.over { border-color: #2f6fed; background: rgba(47,111,237,.06); }
+  #drop span { opacity: .75; font-size: .95rem; }
+  #fileName { margin-top: .75rem; font-size: .9rem; font-weight: 600; word-break: break-all; }
+  button {
+    margin-top: 1.25rem; width: 100%; padding: .75rem; font-size: 1rem;
+    border: 0; border-radius: 8px; background: #2f6fed; color: #fff;
+    cursor: pointer; font-weight: 600;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .tabs { display: flex; gap: .5rem; margin-bottom: 1.25rem; }
+  .tab {
+    flex: 1; margin: 0; padding: .55rem .4rem; font-size: .85rem; font-weight: 600;
+    white-space: nowrap; background: transparent; color: inherit;
+    border: 1px solid #d0d3d9; border-radius: 8px; cursor: pointer; opacity: .7;
+  }
+  .tab.active { background: #2f6fed; color: #fff; border-color: #2f6fed; opacity: 1; }
+  @media (prefers-color-scheme: dark) { .tab { border-color: #3a3f48; } }
+  #status { margin-top: 1rem; font-size: .9rem; min-height: 1.2em; text-align: center; }
+  #status.error { color: #d33; }
+  .spinner {
+    display: inline-block; width: 14px; height: 14px; vertical-align: -2px;
+    border: 2px solid currentColor; border-right-color: transparent;
+    border-radius: 50%; animation: spin .7s linear infinite; margin-right: .4rem;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="title">PDF Translator</h1>
+    <p class="sub" id="subtitle">English → বাংলা · layout preserved</p>
+    <div class="tabs">
+      <button class="tab active" id="tabTranslate" data-mode="translate">Translate</button>
+      <button class="tab" id="tabLocalize" data-mode="localize">Images</button>
+      <button class="tab" id="tabFix" data-mode="fix">Fix</button>
+    </div>
+    <div id="drop">
+      <span>Drop a PDF here or click to choose a file</span>
+      <div id="fileName"></div>
+    </div>
+    <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
+    <button id="translateBtn" disabled>Translate to Bangla</button>
+    <div id="hint" class="sub" style="margin: .75rem 0 0; text-align: center;"></div>
+    <div id="status"></div>
+  </div>
+
+<script>
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const btn = document.getElementById('translateBtn');
+const status = document.getElementById('status');
+const fileNameEl = document.getElementById('fileName');
+const hint = document.getElementById('hint');
+let file = null;
+
+// Each suffix must match the one its endpoint passes to _pdf_response in app.py.
+const MODES = {
+  translate: {
+    endpoint: '/translate', label: 'Translate to Bangla', suffix: '_bn.pdf',
+    busy: 'Translating… this can take a while for long PDFs.',
+    hint: 'Every text block is translated to Bangla; layout, images and graphics are preserved.',
+  },
+  localize: {
+    endpoint: '/localize', label: 'Localize Images', suffix: '_localized.pdf',
+    busy: 'Localizing images… this can take a while while each image is checked and redrawn.',
+    hint: 'Culturally-specific images are adapted to Bangladeshi culture and placed back exactly. Logos, charts and icons are left untouched.',
+  },
+  fix: {
+    endpoint: '/fix', label: 'Fix Bangla PDF', suffix: '_fix.pdf',
+    busy: 'Fixing… re-checking every page for missed translations and overlapping text.',
+    hint: 'Upload a translated _bn.pdf. Text that was never translated is translated again, and text overlapping its neighbour is re-fitted. Pages with no problems are left untouched.',
+  },
+};
+let mode = 'translate';
+
+function applyMode(next) {
+  mode = next;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
+  btn.textContent = MODES[mode].label;
+  hint.textContent = MODES[mode].hint;
+  status.textContent = '';
+  status.className = '';
+}
+
+document.querySelectorAll('.tab').forEach(t =>
+  t.addEventListener('click', () => applyMode(t.dataset.mode)));
+
+function setFile(f) {
+  if (!f) return;
+  if (!f.name.toLowerCase().endsWith('.pdf')) {
+    status.textContent = 'Please choose a PDF file.';
+    status.className = 'error';
+    return;
+  }
+  file = f;
+  fileNameEl.textContent = f.name;
+  btn.disabled = false;
+  status.textContent = '';
+  status.className = '';
+}
+
+drop.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('over');
+  setFile(e.dataTransfer.files[0]);
+});
+
+btn.addEventListener('click', async () => {
+  if (!file) return;
+  const cfg = MODES[mode];
+  btn.disabled = true;
+  status.className = '';
+  status.innerHTML = '<span class="spinner"></span>' + cfg.busy;
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(cfg.endpoint, { method: 'POST', body: form });
+    if (!res.ok) {
+      let msg = 'Request failed.';
+      try { msg = (await res.json()).detail || msg; } catch {}
+      throw new Error(msg);
+    }
+    const summary = res.headers.get('X-Fix-Summary');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = file.name.replace(/\.pdf$/i, '') + cfg.suffix;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    status.textContent = summary
+      ? 'Done — ' + summary
+      : 'Done — your download should start automatically.';
+  } catch (err) {
+    status.textContent = err.message;
+    status.className = 'error';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+applyMode('translate');
+</script>
+</body>
+</html>
