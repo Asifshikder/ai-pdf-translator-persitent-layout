@@ -58,7 +58,12 @@
       "PowerShell(Stop-Job -Name uv -ErrorAction SilentlyContinue)",
       "PowerShell(Remove-Job -Name uv -Force -ErrorAction SilentlyContinue)",
       "PowerShell($B='C:\\\\Users\\\\Asifs\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--pdftranslator\\\\e5d1ddc6-1efc-4508-bd39-ffc35a0c5cf1\\\\scratchpad'; foreach \\($f in @\\(\"$B\\\\t_synth.py\",\"$B\\\\t_verify.py\"\\)\\) { \\(Get-Content $f -Raw\\).Replace\\('_collisions\\(_measure_page\\(entry, archive\\)\\)','_collisions\\(entry, archive\\)'\\).Replace\\('from fix_processor import _collisions, _css_for, _measure_page, fix_pdf','from fix_processor import _collisions, _css_for, fix_pdf'\\).Replace\\('from fix_processor import _collisions, _measure_page, fix_pdf','from fix_processor import _collisions, fix_pdf'\\) | Set-Content $f -Encoding utf8 }; Write-Output 'tests updated')",
-      "PowerShell($env:PYTHONIOENCODING='utf-8'; $B='C:\\\\Users\\\\Asifs\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--pdftranslator\\\\e5d1ddc6-1efc-4508-bd39-ffc35a0c5cf1\\\\scratchpad'; foreach \\($t in @\\('t_short','t_synth','t_untranslated','t_verify'\\)\\) { Write-Output \"############ $t\"; $sw=[Diagnostics.Stopwatch]::StartNew\\(\\); & .\\\\.venv\\\\Scripts\\\\python.exe \"$B\\\\$t.py\" 2>&1 | Select-String -Pattern 'SUMMARY|RESULT|shortened  :|dropped text restored|collisions cleared|all segments now Bangla|byte-identical|preserved|no ink collisions|no dropped text|text drawn|bn intact'; Write-Output \\(\"   elapsed: {0:N1}s\" -f $sw.Elapsed.TotalSeconds\\) })"
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; $B='C:\\\\Users\\\\Asifs\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--pdftranslator\\\\e5d1ddc6-1efc-4508-bd39-ffc35a0c5cf1\\\\scratchpad'; foreach \\($t in @\\('t_short','t_synth','t_untranslated','t_verify'\\)\\) { Write-Output \"############ $t\"; $sw=[Diagnostics.Stopwatch]::StartNew\\(\\); & .\\\\.venv\\\\Scripts\\\\python.exe \"$B\\\\$t.py\" 2>&1 | Select-String -Pattern 'SUMMARY|RESULT|shortened  :|dropped text restored|collisions cleared|all segments now Bangla|byte-identical|preserved|no ink collisions|no dropped text|text drawn|bn intact'; Write-Output \\(\"   elapsed: {0:N1}s\" -f $sw.Elapsed.TotalSeconds\\) })",
+      "PowerShell(git --version; \\(Get-Command git\\).Source)",
+      "Bash(git --version)",
+      "PowerShell(@\\(\"C:\\\\Program Files\\\\Git\\\\cmd\\\\git.exe\",\"C:\\\\Program Files \\(x86\\)\\\\Git\\\\cmd\\\\git.exe\",\"$env:LOCALAPPDATA\\\\Programs\\\\Git\\\\cmd\\\\git.exe\"\\) | ForEach-Object { if \\(Test-Path $_\\) { \"FOUND: $_\" } })",
+      "Bash(git config *)",
+      "Bash(set -e)"
     ]
   }
 }
