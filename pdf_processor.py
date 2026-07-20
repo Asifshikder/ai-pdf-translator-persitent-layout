@@ -605,6 +605,8 @@ def _plan_insert_rects(
 def translate_pdf(pdf_bytes: bytes) -> bytes:
     """Translate all text in a PDF from English to Bangla, preserving layout."""
     import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     start_time = time.time()
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -612,11 +614,10 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
     pages_meta = []
     source_fonts = set()
 
+    # Phase 1: Extract segments from all pages and collect translation requests.
+    extract_start = time.time()
+    page_data = []
     for page_num, page in enumerate(doc, start=1):
-        page_start = time.time()
-        # Record the page's fonts while the source text is still on it: the fix
-        # pipeline tells the text it inserted from the text it must preserve by
-        # asking which fonts were already here.
         source_fonts |= manifest.page_span_fonts(page)
 
         seg_start = time.time()
@@ -625,6 +626,7 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
 
         if not segments:
             logger.debug("Page %d: no translatable segments (%.2fs)", page_num, seg_time)
+            page_data.append((page_num, page, None, None, None))
             continue
 
         logger.debug(
@@ -633,13 +635,42 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
         )
 
         english = [seg["text"] for seg in segments]
-        trans_start = time.time()
-        translations, status = translate_batch_status(english)
-        trans_time = time.time() - trans_start
-        logger.debug("Page %d: translated in %.2fs", page_num, trans_time)
-        # A page whose text the API refused is written back in English, which
-        # looks exactly like a page the translator chose to skip. Say so, and
-        # name the page: the manifest records the same flag, so Fix can retry it.
+        page_data.append((page_num, page, segments, kept, english))
+
+    extract_time = time.time() - extract_start
+    logger.debug("Extracted all segments in %.2fs", extract_time)
+
+    # Phase 2: Translate all pages' segments in parallel.
+    # Instead of waiting for each page's translation before extracting the next,
+    # we send all translation requests concurrently. This is the main speedup.
+    trans_start = time.time()
+    results_by_page = {}
+
+    # Submit all translation jobs and collect futures.
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {}
+        for page_num, page, segments, kept, english in page_data:
+            if english is None:
+                results_by_page[page_num] = (segments, kept, None, None, None)
+            else:
+                future = executor.submit(translate_batch_status, english)
+                futures[future] = (page_num, segments, kept, english)
+
+        # Collect results as they complete.
+        for future in as_completed(futures):
+            page_num, segments, kept, english = futures[future]
+            translations, status = future.result()
+            results_by_page[page_num] = (segments, kept, english, translations, status)
+
+    trans_time = time.time() - trans_start
+    logger.debug("Translated all segments in %.2fs (parallel)", trans_time)
+
+    # Phase 3: Apply redactions and insert translations into each page.
+    for page_num, page, segments, kept, english in page_data:
+        if english is None:
+            continue
+
+        segments, kept, english_check, translations, status = results_by_page[page_num]
         failed = status.count(False)
         if failed:
             logger.warning(
@@ -649,11 +680,9 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
                 failed,
                 len(segments),
             )
+
         _plan_insert_rects(page, segments, kept, _rules(page), _panels(page))
 
-        # Remove only the translatable text: bullets, page numbers and images
-        # are left untouched. Rects are shrunk a hair so redaction never bites
-        # into an adjacent preserved glyph.
         for seg in segments:
             for line_rect in seg["line_rects"]:
                 page.add_redact_annot(line_rect + (0.3, 0.3, -0.3, -0.3), fill=False)
@@ -666,13 +695,6 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
         for seg, translated in zip(segments, translations):
             css = css_for(seg)
             body = html.escape(translated)
-            # The first floor keeps the font readable at 60%, and _plan_insert_rects
-            # has already grown the rect so most text meets it without shrinking.
-            # But a rect boxed in by table borders cannot grow, and insert_htmlbox
-            # draws *nothing at all* when it cannot meet its floor — so drop the
-            # floor rather than lose the text, and let the fix pipeline shorten
-            # whatever ends up below READABLE_FLOOR. A failed call leaves no ink,
-            # so retrying on the same page renders exactly as a clean pass would.
             for low in SCALE_LADDER:
                 spare_height, scale = page.insert_htmlbox(
                     seg["insert_rect"], body, css=css, scale_low=low, archive=archive

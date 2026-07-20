@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.genai import types
 
@@ -100,13 +101,36 @@ def translate_batch_status(texts: list[str]) -> tuple[list[str], list[bool]]:
     indistinguishable from the text alone. The flag tells them apart, so callers
     can retry the first without churning on the second.
     """
-    results = []
-    status = []
-    for start in range(0, len(texts), CHUNK_SIZE):
-        chunk = texts[start : start + CHUNK_SIZE]
-        translations, ok = _translate_chunk(chunk)
-        results.extend(translations)
-        status.extend(ok)
+    # Split into chunks and send them concurrently (up to 3 at a time) to the API.
+    # Sequential chunk processing was the bottleneck: waiting for each API call
+    # before sending the next. Now chunks from multiple pages can be in-flight.
+    chunks = [texts[start : start + CHUNK_SIZE] for start in range(0, len(texts), CHUNK_SIZE)]
+
+    if not chunks:
+        return [], []
+
+    # For a single chunk, no benefit to threading overhead.
+    if len(chunks) == 1:
+        translations, ok = _translate_chunk(chunks[0])
+        return translations, ok
+
+    results = [None] * len(texts)
+    status = [False] * len(texts)
+
+    # Send up to 3 chunks concurrently to API.
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {}
+        for i, chunk in enumerate(chunks):
+            start = i * CHUNK_SIZE
+            futures[executor.submit(_translate_chunk, chunk)] = (i, start, len(chunk))
+
+        for future in as_completed(futures):
+            i, start, chunk_len = futures[future]
+            translations, ok = future.result()
+            for j, (trans, is_ok) in enumerate(zip(translations, ok)):
+                results[start + j] = trans
+                status[start + j] = is_ok
+
     return results, status
 
 
