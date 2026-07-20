@@ -605,7 +605,6 @@ def _plan_insert_rects(
 def translate_pdf(pdf_bytes: bytes) -> bytes:
     """Translate all text in a PDF from English to Bangla, preserving layout."""
     import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     start_time = time.time()
 
@@ -614,10 +613,8 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
     pages_meta = []
     source_fonts = set()
 
-    # Phase 1: Extract segments from all pages and collect translation requests.
-    extract_start = time.time()
-    page_data = []
     for page_num, page in enumerate(doc, start=1):
+        page_start = time.time()
         source_fonts |= manifest.page_span_fonts(page)
 
         seg_start = time.time()
@@ -626,7 +623,6 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
 
         if not segments:
             logger.debug("Page %d: no translatable segments (%.2fs)", page_num, seg_time)
-            page_data.append((page_num, page, None, None, None))
             continue
 
         logger.debug(
@@ -635,47 +631,10 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
         )
 
         english = [seg["text"] for seg in segments]
-        page_data.append((page_num, page, segments, kept, english))
-
-    extract_time = time.time() - extract_start
-    logger.debug("Extracted all segments in %.2fs", extract_time)
-
-    # Phase 2: Translate all pages' segments in parallel.
-    # Instead of waiting for each page's translation before extracting the next,
-    # we send all translation requests concurrently. This is the main speedup.
-    trans_start = time.time()
-    results_by_page = {}
-
-    # Submit all translation jobs and collect futures (2 concurrent to avoid rate limits).
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {}
-        for page_num, page, segments, kept, english in page_data:
-            if english is None:
-                results_by_page[page_num] = (segments, kept, None, None, None)
-            else:
-                future = executor.submit(translate_batch_status, english)
-                futures[future] = (page_num, segments, kept, english)
-
-        # Collect results as they complete (with 5min timeout per page).
-        for future in as_completed(futures, timeout=300):
-            try:
-                page_num, segments, kept, english = futures[future]
-                translations, status = future.result(timeout=5)
-                results_by_page[page_num] = (segments, kept, english, translations, status)
-            except Exception as exc:
-                page_num, segments, kept, english = futures[future]
-                logger.error("Translation for page %d timed out or failed: %s", page_num, exc)
-                results_by_page[page_num] = (segments, kept, english, list(english), [False] * len(english))
-
-    trans_time = time.time() - trans_start
-    logger.debug("Translated all segments in %.2fs (parallel)", trans_time)
-
-    # Phase 3: Apply redactions and insert translations into each page.
-    for page_num, page, segments, kept, english in page_data:
-        if english is None:
-            continue
-
-        segments, kept, english_check, translations, status = results_by_page[page_num]
+        trans_start = time.time()
+        translations, status = translate_batch_status(english)
+        trans_time = time.time() - trans_start
+        logger.debug("Page %d: translated in %.2fs", page_num, trans_time)
         failed = status.count(False)
         if failed:
             logger.warning(
