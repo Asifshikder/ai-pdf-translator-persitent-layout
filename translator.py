@@ -117,8 +117,8 @@ def translate_batch_status(texts: list[str]) -> tuple[list[str], list[bool]]:
     results = [None] * len(texts)
     status = [False] * len(texts)
 
-    # Send up to 3 chunks concurrently to API.
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # Send up to 2 chunks concurrently to API (reduced from 3 to avoid rate limits).
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {}
         for i, chunk in enumerate(chunks):
             start = i * CHUNK_SIZE

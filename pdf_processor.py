@@ -646,8 +646,8 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
     trans_start = time.time()
     results_by_page = {}
 
-    # Submit all translation jobs and collect futures.
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # Submit all translation jobs and collect futures (2 concurrent to avoid rate limits).
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {}
         for page_num, page, segments, kept, english in page_data:
             if english is None:
@@ -656,11 +656,16 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
                 future = executor.submit(translate_batch_status, english)
                 futures[future] = (page_num, segments, kept, english)
 
-        # Collect results as they complete.
-        for future in as_completed(futures):
-            page_num, segments, kept, english = futures[future]
-            translations, status = future.result()
-            results_by_page[page_num] = (segments, kept, english, translations, status)
+        # Collect results as they complete (with 5min timeout per page).
+        for future in as_completed(futures, timeout=300):
+            try:
+                page_num, segments, kept, english = futures[future]
+                translations, status = future.result(timeout=5)
+                results_by_page[page_num] = (segments, kept, english, translations, status)
+            except Exception as exc:
+                page_num, segments, kept, english = futures[future]
+                logger.error("Translation for page %d timed out or failed: %s", page_num, exc)
+                results_by_page[page_num] = (segments, kept, english, list(english), [False] * len(english))
 
     trans_time = time.time() - trans_start
     logger.debug("Translated all segments in %.2fs (parallel)", trans_time)
