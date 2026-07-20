@@ -13,14 +13,15 @@ Then open http://127.0.0.1:8000 in your browser, drop in a PDF, and click **Tran
 
 ## How it works
 
-1. `pdf_processor.py` extracts every text block with its position and style (PyMuPDF).
-2. `translator.py` sends all blocks of a page to Gemini 2.5 Flash on Vertex AI in one
-   batched call with structured JSON output (guaranteed one translation per block).
+1. `pdf_processor.py` extracts every text block with its position and style (PyMuPDF),
+   and groups it into segments — a segment is one paragraph, heading, bullet item or
+   table cell, and is both the unit of translation and the unit of insertion.
+2. `translator.py` sends all segments of a page to Gemini 2.5 Flash on Vertex AI in one
+   batched call with structured JSON output (guaranteed one translation per segment).
 3. Original text is removed with redactions that leave images and vector graphics untouched.
-4. Bangla text is inserted into the exact original box with `insert_htmlbox`, which
-   shapes Bangla properly (conjuncts/matras via HarfBuzz) and **shrinks the font to fit**,
-   down to a floor of 60% (`scale_low=0.6`) — so longer Bangla text never overlaps
-   neighboring content. Fonts: Noto Sans Bengali (in `fonts/`).
+4. Bangla text is inserted into the original box (grown into whatever free space is
+   next to it) with `insert_htmlbox`, which shapes Bangla properly (conjuncts/matras
+   via HarfBuzz) and shrinks the font until it fits. Fonts: Noto Sans Bengali (in `fonts/`).
 5. `manifest.py` embeds a hidden JSON manifest in the output recording every segment's
    English, Bangla, geometry and fit result. Shaped Bangla cannot be read back out of a
    PDF, so this is the only record of what was written — and it is what the Fix tab uses.
@@ -47,10 +48,26 @@ first. Re-running Fix on its own output is a no-op.
   It is git-ignored — never commit or share it.
 - If translation fails for a page (API error, quota), the original English text is
   kept for that page instead of corrupting the document. The Fix tab repairs those.
-- If a block had to shrink below 60% of its original font size, a warning is logged.
-  **Text that still does not fit at that floor is silently dropped from the page** —
-  `insert_htmlbox` draws nothing rather than overflowing. The Fix tab restores it from
-  the manifest; lowering `scale_low` in `pdf_processor.py` would prevent it up front.
+- `insert_htmlbox` draws **nothing at all** when text cannot fit at the `scale_low` it
+  was given — not a warning, not an overflow, just a blank space and a `-1` return. So
+  `SCALE_LADDER` in `pdf_processor.py` ends at `0.0`: with no floor it is free to find
+  whatever scale fits, and text is never lost. A block that lands below 60% is logged.
+- `insert_htmlbox` decides whether text fits from the CSS `line-height`, not from the
+  ink. Bangla draws over ~1.46x its font size, so leading tuned for Latin text reports
+  a comfortable fit while the lines physically overlap — nothing downstream notices.
+  This is why `CSS_TEMPLATE` uses 1.45 and why `test_layout.py` measures rendered pixels.
+
+## Tests
+
+```powershell
+.\.venv\Scripts\python.exe test_layout.py
+```
+
+`test_layout.py` runs the segmentation and box-planning stages against real PDFs and
+makes **no API calls**, so it is free and fast. It covers the defects that keep coming
+back: list items merging into run-on prose, text boxes planned outside the speech bubble
+they belong to, and Bangla lines packed until their ink collides. The Heart Failure
+Manual cases need `OriginalPDF/` and are skipped if it is absent.
 
 ## Setup from scratch
 

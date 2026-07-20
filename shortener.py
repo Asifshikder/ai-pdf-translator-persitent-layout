@@ -10,7 +10,7 @@ import re
 
 from google.genai import types
 
-from vertex_client import get_client
+from vertex_client import generate_content
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def _acceptable(new: str, item: dict) -> bool:
 def _shorten_chunk(items: list[dict]) -> list[str]:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            response = get_client().models.generate_content(
+            response = generate_content(
                 model=MODEL,
                 contents=json.dumps(items, ensure_ascii=False),
                 config=types.GenerateContentConfig(

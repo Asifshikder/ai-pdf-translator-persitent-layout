@@ -8,6 +8,8 @@ its exact position and size."""
 
 import io
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -19,6 +21,9 @@ logger = logging.getLogger(__name__)
 # Images smaller than this (pixels, either dimension) are icons, bullets, rules or
 # logos — never worth a model call. Skipped before any AI classification.
 MIN_DIMENSION = 64
+
+# Number of concurrent image processing tasks (classify + edit)
+CONCURRENT_IMAGES = 3
 
 
 def _to_png(image_bytes: bytes) -> tuple[bytes, int, int] | None:
@@ -60,9 +65,31 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
     on every page that uses it. Any failure keeps the original image.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    # xref -> localized image bytes, or None if the image is kept as-is (or failed).
-    results: dict[int, bytes | None] = {}
 
+    # Collect all unique xrefs across all pages, and their first-seen page number.
+    unique_xrefs: dict[int, int] = {}
+    for page_num, page in enumerate(doc, start=1):
+        for img in page.get_images(full=True):
+            xref = img[0]
+            if xref not in unique_xrefs:
+                unique_xrefs[xref] = page_num
+
+    # Process all unique images concurrently.
+    results: dict[int, bytes | None] = {}
+    with ThreadPoolExecutor(max_workers=CONCURRENT_IMAGES) as executor:
+        futures = {
+            executor.submit(_decide, doc, xref, page_num): xref
+            for xref, page_num in unique_xrefs.items()
+        }
+        for future in as_completed(futures):
+            xref = futures[future]
+            try:
+                results[xref] = future.result()
+            except Exception as exc:
+                logger.exception("Image xref %d processing failed", xref)
+                results[xref] = None
+
+    # Apply the processed images to all pages.
     for page_num, page in enumerate(doc, start=1):
         # Unique xrefs used on this page, in first-seen order.
         xrefs: list[int] = []
@@ -72,8 +99,6 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
 
         placements: list[tuple[fitz.Rect, bytes]] = []
         for xref in xrefs:
-            if xref not in results:
-                results[xref] = _decide(doc, xref, page_num)
             new_image = results[xref]
             if new_image is None:
                 continue
@@ -124,25 +149,37 @@ def _decide(doc: fitz.Document, xref: int, page_num: int) -> bytes | None:
         return None
     png_bytes, width, height = normalized
 
+    start = time.time()
     decision = classify_image(png_bytes, "image/png")
+    classify_time = time.time() - start
+
     if not decision.get("needs_localization"):
         logger.info(
-            "Page %d: xref %d kept — %s",
+            "Page %d: xref %d kept — %s (classify: %.1fs)",
             page_num,
             xref,
             decision.get("reason", "no localization needed"),
+            classify_time,
         )
         return None
 
+    start = time.time()
     new_image = localize_image(png_bytes, "image/png", decision.get("categories", []))
+    edit_time = time.time() - start
+
     if not new_image:
-        logger.warning("Page %d: xref %d edit failed; keeping original", page_num, xref)
+        logger.warning(
+            "Page %d: xref %d edit failed; keeping original (edit: %.1fs)",
+            page_num, xref, edit_time
+        )
         return None
 
     logger.info(
-        "Page %d: xref %d localized (%s)",
+        "Page %d: xref %d localized (%s) — classify: %.1fs, edit: %.1fs",
         page_num,
         xref,
         ", ".join(decision.get("categories", [])) or "cultural content",
+        classify_time,
+        edit_time,
     )
     return _resize_to(new_image, width, height)

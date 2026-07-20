@@ -13,7 +13,7 @@ import logging
 
 from google.genai import types
 
-from vertex_client import get_client
+from vertex_client import generate_content
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ def classify_image(image_bytes: bytes, mime: str) -> dict:
     part = types.Part.from_bytes(data=image_bytes, mime_type=mime)
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            response = get_client().models.generate_content(
+            response = generate_content(
                 model=CLASSIFY_MODEL,
                 contents=[part],
                 config=types.GenerateContentConfig(
@@ -120,7 +120,7 @@ def localize_image(image_bytes: bytes, mime: str, categories: list[str]) -> byte
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            response = get_client().models.generate_content(
+            response = generate_content(
                 model=EDIT_MODEL,
                 contents=[instruction, part],
                 config=types.GenerateContentConfig(

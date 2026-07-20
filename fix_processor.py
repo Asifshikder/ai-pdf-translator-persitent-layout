@@ -21,7 +21,7 @@ import re
 import fitz  # PyMuPDF
 
 import manifest
-from pdf_processor import CSS_TEMPLATE, FONTS_DIR, _span_color_to_css
+from pdf_processor import FONTS_DIR, css_for
 from shortener import shorten_batch
 from translator import translate_batch_status
 
@@ -103,15 +103,6 @@ def _is_dropped(seg: dict) -> bool:
     return seg["sh"] < 0
 
 
-def _css_for(seg: dict) -> str:
-    return CSS_TEMPLATE.format(
-        size=seg["size"],
-        color=_span_color_to_css(seg["color"]),
-        align=seg["align"],
-        bold="font-weight: bold;" if seg["bold"] else "",
-    )
-
-
 def _ink_span(page: fitz.Page) -> tuple[float, float] | None:
     """Top and bottom of the inked pixels on a page, in points."""
     pixmap = page.get_pixmap(dpi=INK_DPI, colorspace=fitz.csGRAY)
@@ -163,7 +154,7 @@ def _fit(
 ) -> tuple[float, float, fitz.Rect | None, float]:
     """Find the highest scale floor at which `text` actually renders."""
     box = manifest.rect_of(seg["ins"])
-    css = _css_for(seg)
+    css = css_for(seg)
     for low in SCALE_LADDER:
         spare, scale, ink = _probe(scratch, box, text, css, archive, low)
         if spare >= 0:
@@ -240,7 +231,7 @@ def _collisions(entry: dict, archive: fitz.Archive) -> list[tuple[int, int]]:
     inks = {}
     for idx in {i for pair in candidates for i in pair}:
         seg = entry["segments"][idx]
-        _, _, ink = _probe(scratch, boxes[idx], seg["bn"], _css_for(seg), archive, seg["sc"])
+        _, _, ink = _probe(scratch, boxes[idx], seg["bn"], css_for(seg), archive, seg["sc"])
         if ink is not None:
             inks[idx] = ink
     scratch.close()
@@ -384,7 +375,7 @@ def _repair_page(
         spare, scale = page.insert_htmlbox(
             manifest.rect_of(seg["ins"]),
             html.escape(text),
-            css=_css_for(seg),
+            css=css_for(seg),
             scale_low=low,
             archive=archive,
         )
