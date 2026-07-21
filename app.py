@@ -3,13 +3,14 @@
 import logging
 import os
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
-from fix_processor import FIX_SUFFIX, fix_pdf
+from docx_export import build_docx
+from fix_processor import FIX_SUFFIX
 from image_processor import localize_pdf
 from manifest import ManifestMissing, ManifestUnsupported
-from pdf_processor import translate_pdf
+from pdf_pipeline import fix_pdf, translate_pdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

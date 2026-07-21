@@ -4,3 +4,5 @@ python-multipart
 pymupdf
 google-genai
 pillow
+python-docx
+fonttools

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Images smaller than this (pixels, either dimension) are icons, bullets, rules or
 # logos — never worth a model call. Skipped before any AI classification.
-MIN_DIMENSION = 64
+MIN_DIMENSION = 40
 
 # Number of concurrent image processing tasks (classify + edit)
 CONCURRENT_IMAGES = 3
@@ -76,6 +76,7 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
 
     # Process all unique images concurrently.
     results: dict[int, bytes | None] = {}
+    logger.info("Found %d unique images to process", len(unique_xrefs))
     with ThreadPoolExecutor(max_workers=CONCURRENT_IMAGES) as executor:
         futures = {
             executor.submit(_decide, doc, xref, page_num): xref
@@ -142,6 +143,10 @@ def _decide(doc: fitz.Document, xref: int, page_num: int) -> bytes | None:
     if not extracted or not extracted.get("image"):
         return None
     if extracted["width"] < MIN_DIMENSION or extracted["height"] < MIN_DIMENSION:
+        logger.debug(
+            "Page %d: xref %d skipped — too small (%dx%d, min %d)",
+            page_num, xref, extracted["width"], extracted["height"], MIN_DIMENSION
+        )
         return None
 
     normalized = _to_png(extracted["image"])
