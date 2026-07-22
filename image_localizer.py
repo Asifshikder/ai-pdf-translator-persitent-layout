@@ -43,14 +43,20 @@ diagrams, charts showing Western settings, or infographics with non-Bangladeshi 
 beverage photos, eating utensils, or food-related diagrams/charts)
 - signage_text: readable signs, labels, or text baked into the image (render in Bangla)
 
+IMPORTANT—text-heavy images: If the image is primarily text, technical diagrams, medical charts, \
+flowcharts, tables with lots of labels/numbers, or any image where text is critical to meaning, \
+return false. Regenerating these risks losing or corrupting the text, which is worse than keeping \
+the original. Only localize text-heavy images if they are simple signs/labels that can be safely \
+translated.
+
 Be decisive, not cautious: if any person is visible, return true even for a simple or \
 stylized illustration. A generic "Western/international" look is exactly what should be \
 localized — do not keep an image just because it looks neutral. Include diagrams and \
 infographics if they show Western contexts, food, or objects that should be made local.
 
 Return needs_localization=false ONLY for pure technical/medical diagrams, flowcharts of \
-abstract concepts, logos with NO cultural context, QR codes, UI buttons, and decorative \
-rules. Also false if the image already clearly looks Bangladeshi.
+abstract concepts, logos with NO cultural context, QR codes, UI buttons, decorative rules, \
+text-heavy charts/tables, and images already looking Bangladeshi.
 
 List only the categories that apply."""
 
@@ -67,9 +73,10 @@ Use skin tones and features consistent with Bangladeshi people. Bring warmth and
 household items to look Bangladeshi. Use rich Bangladeshi visual style, materials, and colors.
 - Food & drinks: Replace Western foods with Bangladeshi equivalents (rice, dal, fish \
 curry, vegetables, tea). Adapt serving dishes and utensils to Bangladeshi style.
-- Text & signs: CRITICAL—preserve ALL text and signs exactly as they appear. {text_instruction}
+- Text & signs: CRITICAL—ALL text, labels, numbers, and signs MUST remain clearly visible \
+and legible. {text_instruction}
 Do not add or remove objects, change the layout, or add new elements beyond cultural \
-adaptation. Focus especially on: {focus}."""
+adaptation. Never blank out, remove, or make illegible any text or labels. Focus especially on: {focus}."""
 
 _CLASSIFY_SCHEMA = {
     "type": "OBJECT",
