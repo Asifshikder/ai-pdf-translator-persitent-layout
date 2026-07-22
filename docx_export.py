@@ -43,8 +43,12 @@ def build_docx(manifest_data: dict) -> bytes:
                 run.font.size = Pt(seg["size"] * BANGLA_SIZE)
                 if seg["bold"]:
                     run.font.bold = True
-                # Color is stored as 0xRRGGBB integer
-                run.font.color.rgb = RGBColor.from_string(f"{seg['color']:06x}")
+                # Color is stored as 0xRRGGBB integer; RGBColor takes (R, G, B) tuple
+                color_int = seg["color"]
+                r = (color_int >> 16) & 0xFF
+                g = (color_int >> 8) & 0xFF
+                b = color_int & 0xFF
+                run.font.color.rgb = RGBColor(r, g, b)
 
     # Write to bytes
     import io

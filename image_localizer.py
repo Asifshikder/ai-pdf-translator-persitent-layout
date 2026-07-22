@@ -55,13 +55,16 @@ rules. Also false if the image already clearly looks Bangladeshi.
 List only the categories that apply."""
 
 EDIT_INSTRUCTION = """Edit this image to reflect Bangladeshi culture and context. Keep the \
-EXACT composition, framing, camera angle, poses, and overall color palette, and keep the \
-same aspect ratio and dimensions. Make these culturally-specific changes:
+EXACT composition, framing, camera angle, and same aspect ratio and dimensions. Make these \
+culturally-specific changes while ensuring the image is VIVID and LIVELY:
+- Visual style: Use warm, natural lighting. Ensure vibrant, saturated colors and dynamic energy. \
+Avoid flat, muted, or static-looking results. Poses and expressions should be engaged and \
+natural, not stiff or formal.
 - People: Make any visible people Bangladeshi with appropriate attire (saree, salwar \
 kameez, panjabi, hijab, lungi, or traditional wear as fitting for age/gender/context). \
-Use skin tones and features consistent with Bangladeshi people.
+Use skin tones and features consistent with Bangladeshi people. Bring warmth and personality to faces.
 - Settings & objects: Adapt architecture, vehicles, streets, buildings, furniture, and \
-household items to look Bangladeshi. Use Bangladeshi visual style, materials, and colors.
+household items to look Bangladeshi. Use rich Bangladeshi visual style, materials, and colors.
 - Food & drinks: Replace Western foods with Bangladeshi equivalents (rice, dal, fish \
 curry, vegetables, tea). Adapt serving dishes and utensils to Bangladeshi style.
 - Text & signs: CRITICAL—preserve ALL text and signs exactly as they appear. {text_instruction}
@@ -137,7 +140,7 @@ def _extract_text_from_image(image_bytes: bytes, mime: str) -> str:
     return ""
 
 
-def localize_image(image_bytes: bytes, mime: str, categories: list[str]) -> bytes | None:
+def localize_image(image_bytes: bytes, mime: str, categories: list[str], page_context: str = "") -> bytes | None:
     """Return edited image bytes adapted to Bangladeshi culture, or None on failure.
 
     None means the caller keeps the original image untouched.
@@ -146,10 +149,10 @@ def localize_image(image_bytes: bytes, mime: str, categories: list[str]) -> byte
     extracted_text = _extract_text_from_image(image_bytes, mime)
     if extracted_text:
         text_instruction = (
-            f"Any text/signage in the image must be preserved EXACTLY as shown. "
-            f"The image contains the following text that MUST appear in the output: {extracted_text}. "
-            f"Keep this text at the same size, position, and style, or translate to Bangla while "
-            f"maintaining the same visual emphasis and placement."
+            f"The image contains baked-in text: {extracted_text}. "
+            f"If you can render a clear, legible Bangla translation in the same style and position, do so. "
+            f"If not confident in Bangla rendering quality, keep the original text exactly as-is rather than "
+            f"blanking or garbling it. Never remove text entirely."
         )
     else:
         text_instruction = "Keep any text or signs exactly as they appear in the image."
@@ -158,25 +161,31 @@ def localize_image(image_bytes: bytes, mime: str, categories: list[str]) -> byte
     instruction = EDIT_INSTRUCTION.format(focus=focus, text_instruction=text_instruction)
     part = types.Part.from_bytes(data=image_bytes, mime_type=mime)
 
+    contents = [instruction, part]
+    if page_context.strip():
+        contents.insert(0, f"Context: {page_context}")
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        temperature = 0.4 + (attempt - 1) * 0.2
         try:
             response = generate_content(
                 model=EDIT_MODEL,
-                contents=[instruction, part],
+                contents=contents,
                 config=types.GenerateContentConfig(
                     response_modalities=["IMAGE"],
-                    temperature=0.4,
+                    temperature=temperature,
                 ),
             )
             out = _first_image_bytes(response)
             if out:
                 return out
             logger.warning(
-                "Localize: no image in response (attempt %d/%d)", attempt, MAX_ATTEMPTS
+                "Localize: no image in response (attempt %d/%d, temp=%.1f)", attempt, MAX_ATTEMPTS, temperature
             )
+            _log_response_diagnostics(response, attempt)
         except Exception:
             logger.exception(
-                "Localize request failed (attempt %d/%d)", attempt, MAX_ATTEMPTS
+                "Localize request failed (attempt %d/%d, temp=%.1f)", attempt, MAX_ATTEMPTS, temperature
             )
     logger.warning("Localize: giving up — keeping original image")
     return None
@@ -192,3 +201,36 @@ def _first_image_bytes(response) -> bytes | None:
             if inline is not None and getattr(inline, "data", None):
                 return inline.data
     return None
+
+
+def _log_response_diagnostics(response, attempt: int) -> None:
+    """Log diagnostics when a response doesn't contain an image."""
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        logger.debug("Attempt %d: no candidates in response", attempt)
+        return
+
+    for i, candidate in enumerate(candidates):
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason and finish_reason != "STOP":
+            logger.warning("Attempt %d: candidate %d finish_reason=%s", attempt, i, finish_reason)
+
+    feedback = getattr(response, "prompt_feedback", None)
+    if feedback:
+        block_reason = getattr(feedback, "block_reason", None)
+        if block_reason:
+            logger.warning("Attempt %d: prompt_feedback.block_reason=%s", attempt, block_reason)
+        safety_ratings = getattr(feedback, "safety_ratings", None)
+        if safety_ratings:
+            for rating in safety_ratings:
+                category = getattr(rating, "category", None)
+                probability = getattr(rating, "probability", None)
+                blocked = getattr(rating, "blocked", None)
+                if blocked or probability == "HIGH":
+                    logger.warning(
+                        "Attempt %d: safety rating %s=%s, blocked=%s",
+                        attempt,
+                        category,
+                        probability,
+                        blocked,
+                    )

@@ -3,14 +3,13 @@
 import logging
 import os
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
-from docx_export import build_docx
-from fix_processor import FIX_SUFFIX
+from fix_processor import FIX_SUFFIX, fix_pdf
 from image_processor import localize_pdf
 from manifest import ManifestMissing, ManifestUnsupported
-from pdf_pipeline import fix_pdf, translate_pdf
+from pdf_processor import translate_pdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,6 +36,8 @@ def _pdf_response(
     headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
     headers.update(extra or {})
     return Response(content=content, media_type="application/pdf", headers=headers)
+
+
 
 
 @app.get("/")

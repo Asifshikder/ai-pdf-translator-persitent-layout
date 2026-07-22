@@ -52,9 +52,10 @@ def generate_content(**kwargs):
     global _use_fallback
     try:
         return get_client().models.generate_content(**kwargs)
-    except Exception:
+    except Exception as e:
         if _use_fallback:
+            logger.warning("Fallback project also failed: %s: %s", type(e).__name__, str(e)[:200])
             raise
-        logger.warning("Primary Vertex AI project failed; switching to fallback project")
+        logger.warning("Primary project failed (%s: %s); switching to fallback", type(e).__name__, str(e)[:200])
         _use_fallback = True
         return get_client().models.generate_content(**kwargs)
