@@ -6,8 +6,11 @@ import os
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
+from extract_images import extract_images
 from fix_processor import FIX_SUFFIX, fix_pdf
+from image_localizer_pipeline import localize_single_image
 from image_processor import localize_pdf
+from image_regen import REGEN_SUFFIX, regenerate_pdf
 from manifest import ManifestMissing, ManifestUnsupported
 from pdf_processor import translate_pdf
 
@@ -71,6 +74,26 @@ async def localize(file: UploadFile = File(...)):
     return _pdf_response(file, localized, "_localized.pdf")
 
 
+@app.post("/regenerate")
+async def regenerate(file: UploadFile = File(...)):
+    pdf_bytes = await _read_pdf(file)
+    try:
+        regenerated, summary = regenerate_pdf(pdf_bytes)
+    except Exception:
+        logger.exception("Image regeneration pipeline failed")
+        raise HTTPException(
+            status_code=500, detail="Image regeneration failed. Check the server logs."
+        )
+
+    # Expose-Headers: fetch() cannot read a custom header unless it is listed.
+    return _pdf_response(
+        file,
+        regenerated,
+        REGEN_SUFFIX,
+        {"X-Regen-Summary": summary, "Access-Control-Expose-Headers": "X-Regen-Summary"},
+    )
+
+
 @app.post("/fix")
 async def fix(file: UploadFile = File(...)):
     pdf_bytes = await _read_pdf(file)
@@ -90,3 +113,38 @@ async def fix(file: UploadFile = File(...)):
         FIX_SUFFIX,
         {"X-Fix-Summary": summary, "Access-Control-Expose-Headers": "X-Fix-Summary"},
     )
+
+
+@app.post("/extract_images")
+async def extract_images_endpoint(file: UploadFile = File(...)):
+    pdf_bytes = await _read_pdf(file)
+    try:
+        zip_bytes = extract_images(pdf_bytes)
+    except Exception:
+        logger.exception("Image extraction pipeline failed")
+        raise HTTPException(status_code=500, detail="Image extraction failed. Check the server logs.")
+
+    out_name = os.path.splitext(os.path.basename(file.filename))[0] + "_images.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+    return Response(content=zip_bytes, media_type="application/zip", headers=headers)
+
+
+@app.post("/localize_images")
+async def localize_images_endpoint(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+    try:
+        localized_bytes = localize_single_image(image_bytes, file.content_type or "image/jpeg")
+    except Exception:
+        logger.exception("Image localization pipeline failed")
+        raise HTTPException(
+            status_code=500, detail="Image localization failed. Check the server logs."
+        )
+
+    out_name = os.path.splitext(os.path.basename(file.filename))[0] + "_localized"
+    ext = os.path.splitext(file.filename)[1] or ".jpg"
+    out_name += ext
+    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+    return Response(content=localized_bytes, media_type=file.content_type or "image/jpeg", headers=headers)

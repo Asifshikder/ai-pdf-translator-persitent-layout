@@ -30,6 +30,11 @@ elderly. It is not written for doctors. Your Bangla must sound like a person exp
 to them kindly, not like a translated document.
 
 Language and register:
+- The reader may have little formal schooling. Any ordinary person must be able to read
+  each sentence once and understand it completely. Never use a transliterated English
+  abbreviation (like "জিপি" for GP) or a technical or bookish word a general reader would
+  not know — always choose the plainest everyday word that carries the meaning. Keep it
+  clear and natural, never long-winded.
 - Write Bangladeshi Bangla in the modern colloquial standard (চলিত). Never সাধু ভাষা.
 - Always address the reader as আপনি. Never তুমি or তোমরা.
 - Say it the way a Bangla speaker would say it, not word by word after the English. English idioms
@@ -51,7 +56,7 @@ Vocabulary:
   symptom → উপসর্গ
   stress → স্ট্রেস
   medication, medicine → ওষুধ (this spelling)
-  GP → জিপি
+  GP → ডাক্তার (never জিপি, which is meaningless to most readers)
   water → পানি (never জল)
   exercise → ব্যায়াম
   salt → লবণ

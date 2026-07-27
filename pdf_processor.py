@@ -2,11 +2,13 @@
 
 import html
 import logging
+import math
 import os
 import re
 
 import fitz  # PyMuPDF
 
+import copy_layer
 import manifest
 from translator import translate_batch_status
 
@@ -56,7 +58,13 @@ CSS_TEMPLATE = """
 # none of them a tick-box option, and no page has options at mismatched sizes.
 # Above this the boxes run out — 0.85 shrinks 70 — and buying more would mean
 # re-stacking each option list and moving its checkbox down to follow the text.
-BANGLA_SIZE = 0.80
+#
+# Raised to 0.90 for print legibility at the user's request: the on-screen size
+# was too small once printed. This trades uniformity for size — well past the 0.80
+# ceiling, so more segments (roughly 100+, extrapolating from the 15→70 jump)
+# shrink-to-fit and dense pages such as the quiz option lists may show text at
+# mismatched sizes. Lower this back toward 0.80 if that crowding is unacceptable.
+BANGLA_SIZE = 0.90
 
 # Bit 4 of span flags marks a bold font.
 BOLD_FLAG = 1 << 4
@@ -142,6 +150,34 @@ PANEL_MIN_AREA = 8000.0
 # path; segments never shrink below their original box, so this only caps growth.
 PANEL_INSET = 0.08
 
+# A bubble is a *simple* closed path. Every speech bubble in the source manuals
+# is 3, 4 or 8 path items — an ellipse is exactly 4 cubic Beziers — while the
+# cover cartoons and illustrations that also read as "large filled shape with a
+# curve" run 22 to 3007 items. The cut cleanly separates 42 bubbles from 121
+# pieces of artwork across the three manuals.
+#
+# Only a bubble earns the treatment below: its outline is a hard boundary the
+# text must stay inside, and it is small and regular enough that a rectangle
+# centred in it is a fair approximation of the space available. Artwork keeps
+# the looser PANEL_INSET cap, which is all it ever needed.
+BUBBLE_MAX_ITEMS = 12
+# Resolution of the shape mask, in pixels per point. The mask only has to
+# resolve an edge to within a quarter point; 4 reproduces the analytic ellipse
+# result to 0.1pt.
+BUBBLE_MASK_DPI = 4
+# Ink kept clear inside the outline, so a glyph never grazes the border. Mostly
+# it covers the mask's own quarter-point quantisation — insert_htmlbox already
+# keeps its ink 2.6-3.7pt inside the box it is handed (see BELOW_GAP). Measured
+# across five bubbles, going from 2.0 to 1.0 buys back 0.2-0.4pt of type.
+BUBBLE_MARGIN = 1.0
+# The candidate rectangles, as an angle sweep: half-extents run
+# (w/2 * cos t, h/2 * sin t), so a low angle is wide and short and a high one is
+# narrow and tall. A one-line caption wants the first, a seven-line quote the
+# last, and which of them a segment wants is not known until it is translated.
+BUBBLE_ANGLES = tuple(range(20, 76, 5))
+# Points sampled along each edge when testing a candidate against the mask.
+BUBBLE_EDGE_SAMPLES = 20
+
 # How close a growing box may come to whatever sits below it.
 #
 # The source already leaves a gap between one line and the next — 1.8pt between
@@ -160,6 +196,12 @@ BELOW_GAP = 0.3
 # at all when it cannot meet its floor, so a floor it can always meet must come
 # last: given no floor it is free to find whatever scale fits.
 SCALE_LADDER = (0.6, 0.4, 0.0)
+
+# How much of a segment an image must cover before the segment counts as printed
+# *on* it. Text laid over a background picture has to stay free to grow, or it
+# would be pinned to the width the English happened to need — but that licence
+# belongs to backdrops only. See `_sits_on`.
+BACKDROP_COVER = 0.9
 
 
 def _span_color_to_css(color_int: int) -> str:
@@ -213,6 +255,36 @@ def _rules(page: fitz.Page) -> list[fitz.Rect]:
             rect = fitz.Rect(rect.x0 - 0.5, rect.y0, rect.x1 + 0.5, rect.y1)
         rules.append(rect)
     return rules
+
+
+def _divider_between(upper: fitz.Rect, lower: fitz.Rect, rules: list[fitz.Rect]) -> bool:
+    """True if a horizontal rule separates two vertically-stacked boxes.
+
+    The merge tests in `_extract_segments` fuse two pieces on font/gap/overlap
+    geometry alone. In a table whose columns are too close to split a row into
+    separate pieces, that let one cell absorb the row stacked below it — the
+    drawn cell border between them was never consulted, because `_rules` reached
+    only the box planner. This is that consultation: a row border sitting in the
+    gap between two boxes, and spanning the width they share, is a hard divider
+    and blocks the merge.
+    """
+    left = max(upper.x0, lower.x0)
+    right = min(upper.x1, lower.x1)
+    if right <= left:  # no horizontal overlap — not stacked in the same column
+        return False
+    top = min(upper.y1, lower.y1)
+    bottom = max(upper.y0, lower.y0)
+    for rule in rules:
+        if rule.width < rule.height:  # a column border, not a row border
+            continue
+        mid_y = (rule.y0 + rule.y1) / 2
+        if not (top - 1 <= mid_y <= bottom + 1):
+            continue
+        # The rule must actually run across the shared column, not merely touch
+        # its edge — a stray tick beside the boxes is not a divider.
+        if min(rule.x1, right) - max(rule.x0, left) > 0.5 * (right - left):
+            return True
+    return False
 
 
 def _vector_marks(page: fitz.Page) -> list[fitz.Rect]:
@@ -275,6 +347,214 @@ def _panel_home(panels: list[fitz.Rect], rect: fitz.Rect) -> fitz.Rect | None:
         -PANEL_INSET * home.width,
         -PANEL_INSET * home.height,
     )
+
+
+def _bubbles(page: fitz.Page) -> list[dict]:
+    """Speech bubbles: the simple closed shapes among `_panels`' candidates.
+
+    Returned as the drawing dicts rather than their rects — the path items are
+    what the mask below is built from, and a bubble's bounding box is exactly
+    the thing that misleads about how much room it has.
+    """
+    found = []
+    for drawing in page.get_drawings():
+        if drawing["type"] not in ("f", "fs"):
+            continue
+        items = drawing["items"]
+        if len(items) > BUBBLE_MAX_ITEMS:
+            continue
+        if not any(item[0] == "c" for item in items):
+            continue
+        if fitz.Rect(drawing["rect"]).get_area() >= PANEL_MIN_AREA:
+            found.append(drawing)
+    return found
+
+
+def _bubble_mask(page: fitz.Page, drawing: dict) -> tuple[fitz.Rect, fitz.Pixmap]:
+    """Redraw one bubble's path, filled, and read it back as a coverage bitmap.
+
+    Rasterising rather than reasoning about the path keeps this honest for any
+    outline the source cares to use — ellipse, rounded rectangle, cloud — and a
+    bubble whose tail is part of the same path needs no special case: the tail
+    is simply too narrow for any candidate rectangle to reach into.
+    """
+    rect = fitz.Rect(drawing["rect"])
+    scratch = fitz.open()
+    canvas = scratch.new_page(width=page.rect.x1, height=page.rect.y1)
+    shape = canvas.new_shape()
+    for item in drawing["items"]:
+        op = item[0]
+        if op == "l":
+            shape.draw_line(item[1], item[2])
+        elif op == "c":
+            shape.draw_bezier(item[1], item[2], item[3], item[4])
+        elif op == "re":
+            shape.draw_rect(item[1])
+        elif op == "qu":
+            shape.draw_quad(item[1])
+    shape.finish(
+        fill=(0, 0, 0),
+        color=None,
+        closePath=True,
+        even_odd=drawing.get("even_odd", False),
+    )
+    shape.commit()
+    pixmap = canvas.get_pixmap(
+        clip=rect,
+        matrix=fitz.Matrix(BUBBLE_MASK_DPI, BUBBLE_MASK_DPI),
+        colorspace=fitz.csGRAY,
+        alpha=False,
+    )
+    scratch.close()
+    return rect, pixmap
+
+
+def _on_ink(rect: fitz.Rect, pixmap: fitz.Pixmap, x: float, y: float) -> bool:
+    """Whether a page-space point lands on the bubble's fill."""
+    px = int((x - rect.x0) * BUBBLE_MASK_DPI)
+    py = int((y - rect.y0) * BUBBLE_MASK_DPI)
+    if not (0 <= px < pixmap.width and 0 <= py < pixmap.height):
+        return False
+    return pixmap.pixel(px, py)[0] < 128
+
+
+def _rect_on_ink(rect: fitz.Rect, pixmap: fitz.Pixmap, candidate: fitz.Rect) -> bool:
+    """Whether every edge of `candidate` lies on the bubble's fill.
+
+    Sampling the perimeter is enough: a rectangle whose whole border sits on a
+    bubble-shaped region has its interior there too.
+    """
+    for i in range(BUBBLE_EDGE_SAMPLES + 1):
+        along = i / BUBBLE_EDGE_SAMPLES
+        x = candidate.x0 + along * candidate.width
+        y = candidate.y0 + along * candidate.height
+        if not (
+            _on_ink(rect, pixmap, x, candidate.y0)
+            and _on_ink(rect, pixmap, x, candidate.y1)
+            and _on_ink(rect, pixmap, candidate.x0, y)
+            and _on_ink(rect, pixmap, candidate.x1, y)
+        ):
+            return False
+    return True
+
+
+def _inscribed_rects(rect: fitz.Rect, pixmap: fitz.Pixmap) -> list[fitz.Rect]:
+    """Every shape of rectangle that fits inside the bubble, centred in it.
+
+    A single rectangle cannot describe an ellipse's room: trading width for
+    height buys back most of what the corners waste, and only the translated
+    text knows which trade it wants. So the whole family is returned and the
+    render step measures them.
+
+    Centring is the point of the exercise. The English was laid out to fit the
+    outline; the taller Bangla can only be laid out to fit it by using the
+    headroom above the original box as well as below it.
+    """
+    mid_x = (rect.x0 + rect.x1) / 2
+    mid_y = (rect.y0 + rect.y1) / 2
+    family = []
+    for degrees in BUBBLE_ANGLES:
+        angle = math.radians(degrees)
+        # Largest centred rectangle of this shape that the mask still accepts.
+        low, high = 0.0, 1.0
+        for _ in range(16):
+            middle = (low + high) / 2
+            half_w = middle * rect.width / 2 * math.cos(angle)
+            half_h = middle * rect.height / 2 * math.sin(angle)
+            if _rect_on_ink(
+                rect,
+                pixmap,
+                fitz.Rect(mid_x - half_w, mid_y - half_h, mid_x + half_w, mid_y + half_h),
+            ):
+                low = middle
+            else:
+                high = middle
+        half_w = low * rect.width / 2 * math.cos(angle) - BUBBLE_MARGIN
+        half_h = low * rect.height / 2 * math.sin(angle) - BUBBLE_MARGIN
+        if half_w > 0 and half_h > 0:
+            family.append(
+                fitz.Rect(mid_x - half_w, mid_y - half_h, mid_x + half_w, mid_y + half_h)
+            )
+    return family
+
+
+def _clip_to_ink(
+    rect: fitz.Rect, pixmap: fitz.Pixmap, base: fitz.Rect, planned: fitz.Rect
+) -> fitz.Rect | None:
+    """The most of `planned` that stays on the bubble's fill, without moving it.
+
+    For a segment that shares its bubble with another, position is not ours to
+    change — moving it would stack it on its neighbour. Two ways to give ground,
+    tried in that order because only the second costs type size:
+
+    1. Hand back growth. `planned` is `base` grown down and right, and growth is
+       free to surrender; trimming it is what a bubble-shaped boundary should
+       have been doing all along.
+    2. If `base` itself escapes the outline, shrink about its centre. Shrinking
+       the *grown* box instead would throw away the original as well as the
+       growth — measured on a nutrition pill, 11.9pt of label became 7.5pt.
+    """
+    inset = (BUBBLE_MARGIN, BUBBLE_MARGIN, -BUBBLE_MARGIN, -BUBBLE_MARGIN)
+
+    def grown(fraction: float) -> fitz.Rect:
+        return fitz.Rect(
+            planned.x0,
+            planned.y0,
+            base.x1 + fraction * (planned.x1 - base.x1),
+            base.y1 + fraction * (planned.y1 - base.y1),
+        )
+
+    if _rect_on_ink(rect, pixmap, grown(0.0) + inset):
+        low, high = 0.0, 1.0
+        for _ in range(16):
+            middle = (low + high) / 2
+            if _rect_on_ink(rect, pixmap, grown(middle) + inset):
+                low = middle
+            else:
+                high = middle
+        return grown(low) + inset
+
+    mid_x = (base.x0 + base.x1) / 2
+    mid_y = (base.y0 + base.y1) / 2
+    low, high = 0.0, 1.0
+    for _ in range(16):
+        middle = (low + high) / 2
+        half_w = middle * base.width / 2
+        half_h = middle * base.height / 2
+        if _rect_on_ink(
+            rect,
+            pixmap,
+            fitz.Rect(mid_x - half_w, mid_y - half_h, mid_x + half_w, mid_y + half_h),
+        ):
+            low = middle
+        else:
+            high = middle
+    half_w = low * base.width / 2 - BUBBLE_MARGIN
+    half_h = low * base.height / 2 - BUBBLE_MARGIN
+    if half_w <= 0 or half_h <= 0:
+        return None
+    return fitz.Rect(mid_x - half_w, mid_y - half_h, mid_x + half_w, mid_y + half_h)
+
+
+def _bubble_home(
+    masks: list[tuple[fitz.Rect, fitz.Pixmap]], rect: fitz.Rect
+) -> tuple[fitz.Rect, fitz.Pixmap] | None:
+    """The smallest bubble whose *fill* the segment's centre lands on.
+
+    Membership by ink rather than by bounding box. A bounding box reaches well
+    past a curved outline, which is how a printer's slug at the page edge ends
+    up "inside" a cover cartoon and how a nutrition label gets claimed by the
+    neighbouring pill instead of its own.
+    """
+    mid_x = (rect.x0 + rect.x1) / 2
+    mid_y = (rect.y0 + rect.y1) / 2
+    home = None
+    for bubble_rect, pixmap in masks:
+        if not _on_ink(bubble_rect, pixmap, mid_x, mid_y):
+            continue
+        if home is None or bubble_rect.get_area() < home[0].get_area():
+            home = (bubble_rect, pixmap)
+    return home
 
 
 def _mark_bullets(
@@ -433,6 +713,12 @@ def _extract_segments(
     turn out to label a piece are kept: the rest are page furniture, and adding
     them would drag the page's text margins out to wherever they sit.
     """
+    # Table borders block a merge (see `_divider_between`): two cells stacked in
+    # one column must not fuse just because their columns sat too close to split
+    # the row. Computed here as well as in `_plan_insert_rects`; a second pass over
+    # the drawings is negligible beside the translation request that follows.
+    rules = _rules(page)
+
     segments = []
     kept = []  # bullets, page numbers, digit-only rows: untouched, but obstacles
 
@@ -476,6 +762,7 @@ def _extract_segments(
                     and min(piece["rect"].x1, prev["rect"].x1)
                     - max(piece["rect"].x0, prev["rect"].x0)
                     > 0.3 * min(piece["rect"].width, prev["rect"].width)
+                    and not _divider_between(prev["rect"], piece["rect"], rules)
                 ):
                     prev["text"] += " " + piece["text"]
                     prev["rect"] |= piece["rect"]
@@ -522,6 +809,7 @@ def _extract_segments(
             and seg["color"] == prev["color"]
             and min(seg["rect"].x1, prev["rect"].x1) - max(seg["rect"].x0, prev["rect"].x0)
             > 0.3 * min(seg["rect"].width, prev["rect"].width)
+            and not _divider_between(prev["rect"], seg["rect"], rules)
         ):
             prev["text"] += " " + seg["text"]
             prev["rect"] |= seg["rect"]
@@ -532,6 +820,22 @@ def _extract_segments(
     for seg in merged:
         seg["align"] = _detect_align(seg["line_rects"], seg["text"], seg["bullet"])
     return merged, kept
+
+
+def _sits_on(rect: fitz.Rect, image: fitz.Rect) -> bool:
+    """True if `rect` is printed over `image` — i.e. the image is this segment's
+    backdrop and must not block its growth.
+
+    The distinction matters because the two cases look alike from a bounding box.
+    A caption inside a speech bubble, or a paragraph over a full-bleed panel, is
+    genuinely laid on the picture and has nowhere else to go. A body paragraph
+    whose last line grazes the top edge of a figure is *not* on it, and treating
+    it as though it were let the box grow a full line down across the artwork —
+    82pt of Bangla over the photo on p.114 of the Heart Failure manual.
+    """
+    if rect.is_empty or image.is_empty:
+        return False
+    return (rect & image).get_area() >= BACKDROP_COVER * rect.get_area()
 
 
 def _plan_insert_rects(
@@ -558,10 +862,39 @@ def _plan_insert_rects(
     # Never grow past the rightmost text on the page (stay inside its margins).
     text_x1 = max(r.x1 for r in kept + [seg["rect"] for seg in segments])
 
+    # A bubble is the one place the planner may move a box rather than only grow
+    # it, so work out who lives in which before planning anything. A bubble with
+    # a single tenant is re-centred in it; one holding several (a two-line title,
+    # a label above its value) is only clamped, since re-centring would stack
+    # them on top of each other.
+    masks = [_bubble_mask(page, drawing) for drawing in _bubbles(page)]
+    homes = {}
+    tenants = {}
+    for seg in segments:
+        home = _bubble_home(masks, seg["rect"])
+        if home is not None:
+            homes[id(seg)] = home
+            tenants[id(home[0])] = tenants.get(id(home[0]), 0) + 1
+
     for seg in segments:
         base = seg["rect"]
+        bubble = homes.get(id(seg))
+        if bubble is not None and tenants[id(bubble[0])] == 1:
+            # The whole bubble is this segment's to use. Hand the render step the
+            # family and let it pick once the Bangla is known; the roomiest is
+            # the right default for anything that never asks.
+            inscribed = _inscribed_rects(*bubble)
+            if inscribed:
+                seg["bubble_rects"] = inscribed
+                seg["insert_rect"] = max(inscribed, key=lambda r: r.get_area())
+                continue
         others = [o for o in solid if o is not base and not o.is_empty]
-        others += [i for i in images if not i.intersects(base) and not i.is_empty]
+        # Foreground pictures: every image except the one this segment is printed
+        # on. Handled separately from `others` below, because an image that
+        # already overlaps `base` still has to block — the old test excused any
+        # image the text touched at all, which is how a paragraph came to grow
+        # down across a figure it had merely grazed.
+        pictures = [i for i in images if not i.is_empty and not _sits_on(base, i)]
         # The one shape a segment may sit on but not leave. Text already inside a
         # bubble was fitted to it by the original layout, so this mostly forbids
         # growth outright — which is the point: there is nowhere for it to go.
@@ -583,6 +916,13 @@ def _plan_insert_rects(
         for o in others:
             if o.x0 >= base.x1 - 1 and min(o.y1, base.y1) - max(o.y0, base.y0) > 1:
                 limit_x1 = min(limit_x1, o.x0 - 4)
+        # A picture standing anywhere to the right of the box's own edge stops it
+        # there. Clamping to `base.x1` rather than to the picture's edge is what
+        # keeps an already-overlapping figure from *shrinking* the box: growth is
+        # refused, never reversed.
+        for i in pictures:
+            if i.x1 > base.x1 and min(i.y1, base.y1) - max(i.y0, base.y0) > 1:
+                limit_x1 = min(limit_x1, max(base.x1, i.x0 - 4))
         new_x1 = max(base.x1, min(target_x1, limit_x1))
 
         # Vertical: about one extra line of height, stopping above whatever
@@ -594,12 +934,77 @@ def _plan_insert_rects(
         for o in others:
             if o.y0 >= base.y1 - 1 and min(o.x1, new_x1) - max(o.x0, base.x0) > 1:
                 limit_y1 = min(limit_y1, o.y0 - BELOW_GAP)
+        for i in pictures:
+            if i.y1 > base.y1 and min(i.x1, new_x1) - max(i.x0, base.x0) > 1:
+                limit_y1 = min(limit_y1, max(base.y1, i.y0 - BELOW_GAP))
         new_y1 = max(base.y1, min(target_y1, limit_y1))
 
         # A small gap after a preserved bullet glyph (the original leading
         # space was stripped from the text).
         x0 = base.x0 + 2 if seg["bullet"] else base.x0
         seg["insert_rect"] = fitz.Rect(x0, base.y0, new_x1, new_y1)
+
+        # Sharing a bubble: keep the planned position, but pull the box back
+        # inside the outline. Refuse a clamp that would cost more than half the
+        # box — overflowing a bubble is bad, vanishing into it is worse.
+        if bubble is not None:
+            clipped = _clip_to_ink(*bubble, base, seg["insert_rect"])
+            if clipped is not None and clipped.get_area() >= 0.5 * base.get_area():
+                seg["insert_rect"] = clipped
+
+
+def _probe(
+    rect: fitz.Rect, body: str, css: str, archive: fitz.Archive, ladder: tuple
+) -> tuple[float, float]:
+    """Render `body` into `rect` off-page and report what it cost to fit."""
+    scratch = fitz.open()
+    canvas = scratch.new_page(width=rect.x1 + 2, height=rect.y1 + 2)
+    spare_height, scale = -1.0, 0.0
+    for low in ladder:
+        spare_height, scale = canvas.insert_htmlbox(
+            rect, body, css=css, scale_low=low, archive=archive
+        )
+        if spare_height >= 0:
+            break
+    scratch.close()
+    return spare_height, scale
+
+
+def render_segment(
+    page: fitz.Page,
+    seg: dict,
+    translated: str,
+    archive: fitz.Archive,
+    ladder: tuple = SCALE_LADDER,
+) -> tuple[float, float]:
+    """Draw one translated segment; report insert_htmlbox's (spare, scale).
+
+    Shared by both translate pipelines so the two cannot drift, and the only
+    place a segment's `insert_rect` is settled: a bubble's tenant arrives with a
+    family of candidate rectangles instead of one, because which shape of box
+    suits it depends on how much Bangla the translation produced. Measuring
+    off-page is the only way to ask — insert_htmlbox reports a fit, it cannot be
+    asked for one.
+    """
+    css = css_for(seg)
+    body = html.escape(translated)
+
+    candidates = seg.get("bubble_rects")
+    if candidates and len(candidates) > 1:
+        best, best_scale = seg["insert_rect"], -1.0
+        for candidate in candidates:
+            spare_height, scale = _probe(candidate, body, css, archive, ladder)
+            if spare_height >= 0 and scale > best_scale:
+                best, best_scale = candidate, scale
+        seg["insert_rect"] = best
+
+    for low in ladder:
+        spare_height, scale = page.insert_htmlbox(
+            seg["insert_rect"], body, css=css, scale_low=low, archive=archive
+        )
+        if spare_height >= 0:
+            break
+    return spare_height, scale
 
 
 def translate_pdf(pdf_bytes: bytes) -> bytes:
@@ -657,20 +1062,22 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
 
         metrics = []
         for seg, translated in zip(segments, translations):
-            css = css_for(seg)
-            body = html.escape(translated)
-            for low in SCALE_LADDER:
-                spare_height, scale = page.insert_htmlbox(
-                    seg["insert_rect"], body, css=css, scale_low=low, archive=archive
-                )
-                if spare_height >= 0:
-                    break
+            spare_height, scale = render_segment(page, seg, translated, archive)
             metrics.append((spare_height, scale))
+            # Invisible logical-text layer so the shaped Bangla is copy-pasteable.
+            # Uses the same rendered size (BANGLA_SIZE * winning scale) so the
+            # selection box roughly tracks the visible text.
+            copy_layer.add_invisible_text(
+                page, seg["insert_rect"], translated, seg["size"] * BANGLA_SIZE * scale
+            )
             if 0 < scale <= SCALE_LADDER[0]:
                 logger.warning(
-                    "Page %d: text hit the %.0f%% shrink floor and may overflow: %r at %s",
+                    "Page %d: text hit the %.0f%% shrink floor%s: %r at %s",
                     page_num,
                     scale * 100,
+                    " with the whole bubble already given to it"
+                    if seg.get("bubble_rects")
+                    else " and may overflow",
                     translated[:40],
                     seg["insert_rect"],
                 )
@@ -694,6 +1101,9 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
     manifest.attach(doc, data)
 
     doc.subset_fonts()
+    # Neutralise the shaped Bangla layer so copy returns only the clean invisible
+    # layer added above. Must run after subset_fonts(), which rewrites ToUnicode.
+    copy_layer.blank_shaped_tounicode(doc)
     out = doc.tobytes(garbage=3, deflate=True)
     doc.close()
 

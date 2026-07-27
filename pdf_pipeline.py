@@ -11,7 +11,6 @@ Fonts are embedded in full instead of subsetted — this increases file size but
 to preserve correct rendering in other tools and when converting to DOCX.
 """
 
-import html
 import logging
 import re
 import time
@@ -36,7 +35,7 @@ from pdf_processor import (
     _plan_insert_rects,
     _rules,
     _vector_marks,
-    css_for,
+    render_segment,
 )
 from translator import translate_batch_status
 
@@ -100,14 +99,9 @@ def translate_pdf(pdf_bytes: bytes) -> bytes:
 
         metrics = []
         for seg, translated in zip(segments, translations):
-            css = css_for(seg)
-            body = html.escape(translated)
-            for low in TRANSLATE_SCALE_LADDER:
-                spare_height, scale = page.insert_htmlbox(
-                    seg["insert_rect"], body, css=css, scale_low=low, archive=archive
-                )
-                if spare_height >= 0:
-                    break
+            spare_height, scale = render_segment(
+                page, seg, translated, archive, TRANSLATE_SCALE_LADDER
+            )
             metrics.append((spare_height, scale))
             if 0 < scale <= TRANSLATE_SCALE_LADDER[0]:
                 logger.warning(

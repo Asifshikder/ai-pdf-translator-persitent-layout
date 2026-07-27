@@ -21,10 +21,13 @@ from pdf_processor import (
     BANGLA_SIZE,
     CSS_TEMPLATE,
     FONTS_DIR,
+    _bubble_home,
+    _bubble_mask,
+    _bubbles,
     _extract_segments,
-    _panel_home,
     _panels,
     _plan_insert_rects,
+    _rect_on_ink,
     _rules,
     _vector_marks,
     css_for,
@@ -36,6 +39,18 @@ QUIZ_PDF = os.path.join(
 )
 SAMPLE_PDF = os.path.join(
     BASE_DIR, "Heart Manual_Post Myocardial Infarction (1)-1-20.pdf"
+)
+RATING_PDF = os.path.join(
+    BASE_DIR, "OriginalPDF", "Heart Manual Revascularisation (3) [65-91].pdf"
+)
+# The full manual: 42 speech bubbles, the largest sample of them anywhere here.
+BUBBLE_PDF = os.path.join(
+    BASE_DIR, "OriginalPDF", "Heart Failure Manual v4 2021 (1).pdf"
+)
+# Its cover is a vector cartoon of 67-181 path items — a large filled shape with
+# curves in it, and so a panel, but emphatically not a bubble.
+ARTWORK_PDF = os.path.join(
+    BASE_DIR, "OriginalPDF", "Heart Manual_Post Myocardial Infarction (1).pdf"
 )
 
 failures = []
@@ -144,6 +159,38 @@ def test_weekly_plan_rows_stay_separate(doc):
     )
 
 
+def test_rating_grid_rows_stay_separate(doc):
+    """A questionnaire rating grid must not fuse its rows into one cell.
+
+    The statements sit one per row with a "1 2 3 4 5" rating column to their
+    right. That column is too close to split the row into separate pieces, so the
+    row was not `standalone` and the vertical merge absorbed the row below it —
+    five statements collapsed into one blob, translated as a run-on sentence and
+    drawn across one cell while the rows it swallowed came out empty. The drawn
+    row borders were never consulted; now they block the merge.
+    """
+    _, segments, _ = plan_page(doc, 23)
+    rows = ["I exercise", "I practise relaxation", "I practise correct breathing",
+            "I smoke", "I eat a healthy diet"]
+
+    fused = [
+        t for t in texts(segments)
+        if sum(r in t for r in rows) >= 2
+    ]
+    check(
+        "page 23: the rating grid's rows are not fused into one segment",
+        not fused,
+        f"rows merged across their borders: {fused[:1]}",
+    )
+
+    missing = [r for r in rows if r not in texts(segments)]
+    check(
+        "page 23: each lifestyle statement is its own segment",
+        not missing,
+        f"these rows never surfaced as their own segment: {missing}",
+    )
+
+
 def test_wrapped_cell_stays_one_segment(doc):
     """A cell whose text wraps must stay one segment.
 
@@ -195,36 +242,106 @@ def test_segment_boxes_do_not_overlap(doc):
     )
 
 
+def bubble_homes(page, segments):
+    """Every (segment, bubble mask) pair on a page, by ink membership."""
+    masks = [_bubble_mask(page, drawing) for drawing in _bubbles(page)]
+    if not masks:
+        return []
+    pairs = []
+    for seg in segments:
+        home = _bubble_home(masks, seg["rect"])
+        if home is not None:
+            pairs.append((seg, home))
+    return pairs
+
+
 def test_no_box_escapes_its_bubble(doc):
-    """No text box may be planned outside the bubble its text sits in.
+    """No text box may be planned outside the ink of the bubble it sits in.
 
     Bubbles are filled curves, invisible to `_rules`, so quote boxes were grown
-    11-42pt past the bubble's bottom edge and the text landed on the page.
+    11-42pt past the bubble's bottom edge and the text landed on the page. The
+    first fix capped growth at the bubble's *bounding box* inset 8%, which for
+    an ellipse is nowhere near enough — an aspect-matched inscribed rectangle
+    needs 29.3% — so 48 of 52 bubble segments still had a corner outside the
+    ink, and because the bubble text is white the overflow read as clipped.
+
+    Tested against the fill itself, with no allowance for the original box: the
+    planner may now move a bubble's text, so "it was already like that" is no
+    longer an excuse it can offer.
     """
     escapes = []
+    checked = 0
     for page_num in range(1, doc.page_count + 1):
         page, segments, _ = plan_page(doc, page_num)
-        panels = _panels(page)
-        if not panels:
-            continue
-        for seg in segments:
-            home = _panel_home(panels, seg["rect"])
-            if home is None:
-                continue
+        for seg, (bubble_rect, mask) in bubble_homes(page, segments):
+            checked += 1
             ins = seg["insert_rect"]
-            # The original box is the floor: a segment never shrinks below it, so
-            # only growth beyond it and beyond the bubble counts as an escape.
-            over_y = ins.y1 - max(home.y1, seg["rect"].y1)
-            over_x = ins.x1 - max(home.x1, seg["rect"].x1)
-            if max(over_y, over_x) > 0.5:
+            if not _rect_on_ink(bubble_rect, mask, ins):
                 escapes.append(
-                    f"p{page_num}: box {tuple(round(v) for v in ins)} leaves bubble "
-                    f"(over_y={over_y:.1f} over_x={over_x:.1f}) {seg['text'][:40]!r}"
+                    f"p{page_num}: box {tuple(round(v) for v in ins)} leaves the "
+                    f"bubble at {tuple(round(v) for v in bubble_rect)} "
+                    f"{seg['text'][:40]!r}"
                 )
     check(
-        "no text box is planned outside its bubble",
+        f"no text box is planned outside its bubble ({checked} checked)",
         not escapes,
         f"{len(escapes)} escapes, e.g.\n          " + "\n          ".join(escapes[:3]),
+    )
+
+
+def test_bubble_text_uses_the_headroom_above_it(doc):
+    """A bubble's sole tenant is re-centred in it, not pinned where English was.
+
+    The planner otherwise only ever grows a box down and right, so the taller
+    Bangla pushed out of the bottom of a bubble while the space above the
+    original line went unused. A bubble with one tenant is the one case where
+    moving the box is safe, and it is the case that pays: the rect is centred on
+    the fill, which is where the English was centred to begin with.
+    """
+    lifted = []
+    tenants = 0
+    for page_num in range(1, doc.page_count + 1):
+        page, segments, _ = plan_page(doc, page_num)
+        for seg, _home in bubble_homes(page, segments):
+            if not seg.get("bubble_rects"):
+                continue  # shares its bubble: clamped, deliberately not moved
+            tenants += 1
+            if seg["insert_rect"].y0 < seg["rect"].y0 - 0.5:
+                lifted.append(page_num)
+    check(
+        f"bubble text reclaims the space above it ({len(lifted)}/{tenants} lifted)",
+        tenants > 0 and len(lifted) >= 0.5 * tenants,
+        f"only {len(lifted)} of {tenants} sole tenants were raised above their "
+        "original top edge; centring is not taking effect",
+    )
+
+
+def test_bubble_membership_ignores_artwork(doc):
+    """A cover cartoon is a panel but not a bubble, and hosts no text.
+
+    `_panels` accepts any large filled shape with a curve in it, which on this
+    cover matches the cartoon and its limbs. Judged by bounding box, a 6pt
+    printer's slug at the page edge then counts as living "inside" it — and
+    would be re-centred into the middle of the artwork. A bubble is a simple
+    closed path, and membership is by fill, not by bounding box.
+    """
+    page = doc[0]
+    panels = _panels(page)
+    bubbles = _bubbles(page)
+    check(
+        "the cover cartoon reads as a panel but not as a bubble",
+        bool(panels) and not bubbles,
+        f"{len(panels)} panels, {len(bubbles)} bubbles "
+        f"(item counts: {[len(d['items']) for d in bubbles]})",
+    )
+
+    _, segments, _ = plan_page(doc, 1)
+    slugs = [seg for seg in segments if seg["text"].startswith("HM Post MI")]
+    check(
+        "the printer's slug is not adopted by the artwork behind it",
+        bool(slugs) and not bubble_homes(page, slugs),
+        f"found {len(slugs)} slug segments, "
+        f"{len(bubble_homes(page, slugs))} of them claimed by a bubble",
     )
 
 
@@ -381,6 +498,87 @@ def test_bangla_lines_do_not_collide():
         )
 
 
+def test_text_does_not_grow_onto_a_picture():
+    """A paragraph that merely grazes a figure must not expand across it.
+
+    Real geometry from p.114 of the translated Heart Failure manual: the right column
+    ran to y=605 and the illustration of a man holding a sign occupied
+    (421, 600)-(596, 843). Because the English text's last line already overlapped the
+    top of that image by a few points, the planner excused the image from the obstacle
+    list altogether and grew the Bangla box a full line further down — 82pt of text
+    printed straight over the picture.
+
+    The distinction the planner has to make is between a picture the text sits *on*
+    (a backdrop, checked separately below) and one it happens to touch.
+    """
+    image = fitz.Rect(421.1, 600.2, 596.3, 842.9)
+    doc = fitz.open()
+    page = doc.new_page(width=595.276, height=841.89)
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8))
+    pixmap.set_rect(pixmap.irect, (200, 180, 160))
+    page.insert_image(image, pixmap=pixmap)
+    # Two lines close enough to merge into one segment, positioned so the second
+    # already dips a few points past the top of the image — the condition that made
+    # the old planner stop treating the image as an obstacle at all.
+    page.insert_text((313, 590), "Losing weight is worth keeping up", fontsize=10)
+    page.insert_text((313, 604), "and adding to over time", fontsize=10)
+
+    segments, kept = _extract_segments(page, _vector_marks(page))
+    body = [s for s in segments if "weight" in s["text"]]
+    if not body:
+        check("p.114 overflow fixture builds", False, "no segment extracted")
+        doc.close()
+        return
+    seg = body[0]
+    base = fitz.Rect(seg["rect"])
+    _plan_insert_rects(page, segments, kept, _rules(page), _panels(page))
+    grown = seg["insert_rect"]
+    doc.close()
+
+    added = (grown & image).get_area() - (base & image).get_area()
+    check(
+        "a box does not grow onto a picture it only grazes",
+        added <= 1.0,
+        f"gained {added:.0f}pt² of the image (base {base}, grown {grown})",
+    )
+    check(
+        "…and is not shrunk below where it started",
+        grown.y1 >= base.y1 - 0.01 and grown.x1 >= base.x1 - 0.01,
+        f"grown {grown} is smaller than base {base}",
+    )
+
+
+def test_text_may_still_grow_on_its_backdrop():
+    """The other half of the same rule: text printed over a full-bleed picture has
+    nowhere else to go, so the picture must not block it. Pinning such a box to the
+    width the English happened to need is what forces the Bangla down to 9pt."""
+    backdrop = fitz.Rect(0, 0, 595.276, 841.89)
+    doc = fitz.open()
+    page = doc.new_page(width=595.276, height=841.89)
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8))
+    pixmap.set_rect(pixmap.irect, (240, 240, 250))
+    page.insert_image(backdrop, pixmap=pixmap)
+    page.insert_text((60, 300), "Look after your heart", fontsize=14)
+
+    segments, kept = _extract_segments(page, _vector_marks(page))
+    body = [s for s in segments if "heart" in s["text"]]
+    if not body:
+        check("backdrop fixture builds", False, "no segment extracted")
+        doc.close()
+        return
+    seg = body[0]
+    base = fitz.Rect(seg["rect"])
+    _plan_insert_rects(page, segments, kept, _rules(page), _panels(page))
+    grown = seg["insert_rect"]
+    doc.close()
+
+    check(
+        "text on a full-page backdrop is still free to grow",
+        grown.width > base.width + 1 or grown.height > base.height + 1,
+        f"box was pinned to its English size: base {base}, grown {grown}",
+    )
+
+
 def test_sample_pdf_regressions(doc):
     """The previously-working sample must not regress.
 
@@ -451,6 +649,35 @@ def main() -> int:
         doc.close()
     else:
         skipped.append(f"{SAMPLE_PDF} not found")
+
+    if os.path.exists(RATING_PDF):
+        doc = fitz.open(RATING_PDF)
+        print("\nHeart Manual Revascularisation [65-91] — questionnaire grid")
+        test_rating_grid_rows_stay_separate(doc)
+        doc.close()
+    else:
+        skipped.append(f"{RATING_PDF} not found")
+
+    if os.path.exists(BUBBLE_PDF):
+        doc = fitz.open(BUBBLE_PDF)
+        print("\nHeart Failure Manual (full) — speech bubbles")
+        test_no_box_escapes_its_bubble(doc)
+        test_bubble_text_uses_the_headroom_above_it(doc)
+        doc.close()
+    else:
+        skipped.append(f"{BUBBLE_PDF} not found")
+
+    if os.path.exists(ARTWORK_PDF):
+        doc = fitz.open(ARTWORK_PDF)
+        print("\nHeart Manual Post MI — bubble detection vs artwork")
+        test_bubble_membership_ignores_artwork(doc)
+        doc.close()
+    else:
+        skipped.append(f"{ARTWORK_PDF} not found")
+
+    print("\nText growth around pictures")
+    test_text_does_not_grow_onto_a_picture()
+    test_text_may_still_grow_on_its_backdrop()
 
     print("\nBangla line spacing")
     test_bangla_lines_do_not_collide()
