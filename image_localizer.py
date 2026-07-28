@@ -10,6 +10,8 @@ never corrupted (mirrors translator._translate_chunk)."""
 
 import json
 import logging
+import re
+import time
 
 from google.genai import types
 
@@ -21,14 +23,25 @@ logger = logging.getLogger(__name__)
 CLASSIFY_MODEL = "gemini-2.5-flash"  # For classification and text translation
 TEXT_TRANSLATE_MODEL = "gemini-2.5-flash"  # For translating text to Bangla
 
-# Image generation/editing models, tried in order. If the primary is rate-limited (429) or
-# unavailable, the next model is used — an independent path when nano-banana's quota is exhausted.
-EDIT_MODEL = "gemini-2.5-flash-image"
-EDIT_MODEL_FALLBACKS = ["gemini-3.1-flash-lite-image", "gemini-3.1-flash-image"]
+# Image generation/editing models, tried in order. Ordered by measured framing fidelity: text is
+# restored onto blank surfaces at positions measured before the edit, so a model that shifts or
+# rescales a placard leaves that text hanging off it. See the table in image_regen.EDIT_MODELS.
+#
+# The chain is NOT a quota escape: the image quota is per-project and shared across all image
+# models, so a 429 on one is a 429 on every one of them. It helps only when a model refuses.
+EDIT_MODEL = "gemini-3.1-flash-lite-image"
+EDIT_MODEL_FALLBACKS = ["gemini-2.5-flash-image", "gemini-3.1-flash-image"]
 EDIT_MODELS = [EDIT_MODEL, *EDIT_MODEL_FALLBACKS]
 # Attempts per model before moving to the next one (transient 429/503 backoff is handled inside
 # vertex_client.generate_content, so a couple of attempts per model is plenty).
 EDIT_ATTEMPTS_PER_MODEL = 2
+
+# Quality over speed: an image that failed only because the project was out of quota must not
+# ship untouched. The image quota is per-MINUTE and shared by every image model, so waiting
+# out a minute is the only thing that clears it — the model chain cannot. Two extra passes
+# costs at most ~2.5 minutes on a picture that would otherwise be lost.
+EDIT_QUOTA_RETRY_PASSES = 2
+EDIT_QUOTA_COOLDOWN_SEC = 70.0
 
 MAX_ATTEMPTS = 5
 
@@ -58,18 +71,45 @@ infographics if they show Western contexts, food, or objects that should be made
 Even text-heavy images of food, scenes, or objects should be localized — the text will be \
 handled explicitly during image editing.
 
+A cartoon, line drawing, sketch or simplified illustration of a REAL thing is not \
+"abstract" — it is a picture of that thing, and it counts. A cartoon car is a car (a \
+vehicle: an object). A cartoon person is a person. A hand-drawn house is a building. A \
+simple sketch of a plate of food is food. Style has nothing to do with it: only a diagram \
+of a pure concept — a flowchart of ideas, an arrow, a graph of quantities, a gradient or \
+an ornamental shape — is abstract. If you can name the real-world thing the drawing shows, \
+and that thing is a person, a place, a vehicle, a building, a garment, a utensil, a piece \
+of furniture, a household object or food, return needs_localization=true.
+
 Return needs_localization=false ONLY for:
 - Pure medical/clinical images: x-rays, CT scans, anatomical diagrams, clinical charts, \
 and medical reference images where the image's primary purpose is technical/diagnostic.
-- Functional technical elements that must remain intact: QR codes, UI chrome, buttons, \
-decorative rules, flowcharts of pure abstract concepts.
+- Functional technical elements that must remain intact: QR codes, barcodes, UI chrome, \
+buttons, decorative rules, arrows, ornamental shapes, colour gradients, and flowcharts or \
+graphs of pure abstract concepts. These are things with no real-world subject at all — do \
+not put a drawing of a real object in this group because it is drawn simply.
 - Images already looking authentically Bangladeshi.
 
 List only the categories that apply.
 
 FIRST, before anything else, answer is_logo. A logo is the identity of a real organisation \
 and is never ours to change — not its drawing, not its colours, and above all not its \
-wording. Return is_logo=true for:
+wording.
+
+Answer is_logo=true whenever a mark is present anywhere in the image, then answer \
+logo_fills_image to say WHICH of the two situations it is:
+- logo_fills_image=true — the image IS the mark. The mark and its immediate lockup are \
+essentially the whole picture; there is nothing else in the frame but the mark and its \
+background. This image will be left exactly as printed.
+- logo_fills_image=false — the image CONTAINS a mark. It is a photograph, illustration, \
+diagram or chart with an organisation's mark somewhere in it, typically in a corner or along \
+an edge, and the rest of the frame is a real subject: people, food, a place, a chart. The \
+mark is found and protected separately by its own detector — its pixels stay as printed and \
+its wording is never translated — while the rest of the picture is localized normally.
+Getting this wrong in the "fills" direction is expensive: a whole photograph of a meal was \
+left in English because a food agency's crest sat in its top corner. If the frame holds a \
+real subject as well as the mark, answer false.
+
+Return is_logo=true for:
 - Any logo, wordmark, lettermark, emblem, crest, seal, coat of arms, badge or roundel.
 - Any brand or product mark, and any charity, hospital, trust, university, government, \
 ministry, NHS, WHO or other institutional mark.
@@ -79,24 +119,36 @@ up with a symbol, a masthead — even when it is only lettering.
 - Copyright lines, registration numbers, ISBNs and publisher imprints.
 - Any of the above even when it also contains people, a building, a plant or a landscape: a \
 crest with a lion in it is a crest, not a picture of a lion.
-When is_logo=true, needs_localization MUST be false, and its text must NOT be translated. \
-If you are unsure whether a mark is a logo, answer true — a redrawn or translated logo \
-misrepresents a real organisation, while a logo left alone costs the document nothing.
+When is_logo=true AND logo_fills_image=true, needs_localization MUST be false, and the \
+mark's text must NOT be translated. When is_logo=true but logo_fills_image=false, judge \
+needs_localization on the rest of the picture as usual — the mark itself is protected \
+elsewhere. If you are unsure whether a mark is a logo, answer is_logo=true; if you are \
+unsure whether it fills the frame, answer logo_fills_image=false, because a picture wrongly \
+called a whole logo is deleted from the localization entirely while a mark inside a picture \
+is still protected.
 
 Separately, judge information_role — what the picture is FOR. This is not the same \
 question as whether it can be localized, and you must answer it independently:
-- "referential": the specific thing shown IS the information. Redrawing it as something \
-else would make the surrounding document factually wrong. This covers a drink pictured to \
-define a measure or dose, a food pictured to place it in a food group or show a portion \
-size, a labelled specimen or product shown so the reader can recognise it, a picture \
-carrying a number/quantity/percentage that refers to what is depicted, and any single tile \
-of a chart, key, grid or comparison series.
-- "decorative": the picture illustrates, sets a scene, or shows people doing something. \
-Someone talking to a nurse, a family at a meal, a person walking, a figure holding a sign. \
-Changing what is depicted costs the document nothing factual.
-When the two readings are both arguable, answer "referential" — a picture redrawn when it \
-should not have been is a factual error in the document, while one left alone is merely \
-un-localized."""
+- "referential": the specific thing shown IS a datum the page states in words. Redrawing it \
+as something else would make the page factually WRONG, not merely less local. This is: a \
+drink or a food pictured to define a measure, a unit or a dose ("1.5 units", "one portion = \
+80g"); a labelled specimen, product, tablet or piece of equipment the reader is meant to \
+recognise; one tile of a chart, key, grid or comparison series whose tiles are being \
+contrasted with each other; and any picture printed beside a number, percentage or quantity \
+that describes what is in the picture.
+- "decorative": everything else, INCLUDING ordinary pictures of food and meals. A plate of \
+food illustrating what balanced eating looks like, a family at a meal, someone talking to a \
+nurse, a person walking, a figure holding a sign. These are decorative because the document \
+states nothing factual about the particular dish or the particular person shown. A picture \
+is not referential merely because it shows food, or because the page it sits on is about \
+health.
+Worked examples: a photograph of a plate divided into food groups, printed to show what a \
+balanced diet looks like -> decorative (the groups are what matter, and the redraw is \
+separately required to keep the same food groups and the same portions). One card in a row \
+of eight, each showing a drink beside the number of alcohol units in it -> referential.
+When the two readings are genuinely both arguable, answer "referential" — a picture redrawn \
+when it should not have been is a factual error in the document, while one left alone is \
+merely un-localized."""
 
 # Two ways to regenerate a picture, chosen per image by image_processor._regeneration_mode:
 #
@@ -129,6 +181,11 @@ afterwards at fixed positions, so a board that moves or shrinks leaves that text
 off it and overlapping the artwork.
   - Do not zoom in or out, and do not change how much of the subject is visible or how much \
 empty space surrounds it.
+  - Return the picture at the SAME aspect ratio you were given. Do not pad it, do not crop \
+it, and do not fit it into a square or a 2:3 frame.
+  - If you cannot keep a board, card or placard exactly where it is, leave that part of the \
+picture unchanged rather than moving it. A blank surface that has shifted is worse than one \
+that was never adapted: real text is printed onto it afterwards at fixed positions.
 CRITICAL — MATCH THE ORIGINAL'S COLOURS:
   - This picture is printed inside a document, surrounded by the page it sits on. It must \
 still look like it belongs to that page, so the palette is not yours to change.
@@ -150,8 +207,18 @@ Use skin tones and features consistent with Bangladeshi people. Keep poses, gest
 expressions as engaged and natural as the original's, and rendered in the original's style.
 - Settings & objects: Adapt architecture, vehicles, streets, buildings, furniture, and \
 household items to look Bangladeshi — but drawn in the original's palette and style.
-- Food & drinks: Replace Western foods with Bangladeshi equivalents (rice, dal, fish \
-curry, vegetables, tea). Adapt serving dishes and utensils to Bangladeshi style.
+CRITICAL — FOOD RULES. All three apply, in this order:
+  1. HALAL ONLY. Never depict pork, ham, bacon, lard, alcohol, beer, wine, or a wine glass. \
+If the original shows one, replace it with a halal food filling the same role.
+  2. KEEP THE NUTRITIONAL MEANING. This picture is printed in a health booklet, where a food \
+is very often shown to represent a food group, a portion size, a measure or a dose. The \
+replacement MUST be in the SAME food group and show the SAME portion: oily fish -> ilish or \
+rui (never dal); wholegrain -> lal chal or atta ruti (never white rice); leafy vegetable -> \
+lal shak or palong shak; pulse -> dal; dairy -> doi or milk; fruit -> a fruit. Never swap \
+across food groups, and never change how much food is shown or how many items are on the plate.
+  3. MAKE IT BANGLADESHI. Subject to rules 1 and 2, replace Western dishes with everyday \
+Bangladeshi food — bhat, dal, machher jhol, shobji, cha — served on Bangladeshi plates and \
+eaten with Bangladeshi utensils.
 - Text & signs: {text_instruction}
 CRITICAL — NO TEXT:
   - Do NOT draw, write, render, or hallucinate ANY text, letters, words, numbers, or symbols.
@@ -182,7 +249,9 @@ at fixed positions, so one that moves or shrinks leaves that text overlapping th
 original.{palette} Do not brighten, restyle, or turn a flat drawing into a photo.
 - People become Bangladeshi: skin tones, features, and dress (saree, salwar kameez, panjabi, \
 hijab, lungi) suited to their age and role.
-- Food becomes Bangladeshi (rice, dal, fish curry, vegetables, tea), served in Bangladeshi dishes.
+- Food becomes Bangladeshi and halal — never pork, alcohol, beer or wine — and stays in the \
+SAME food group and the SAME portion as the original (oily fish -> ilish or rui, wholegrain \
+-> lal chal or atta ruti, pulse -> dal, dairy -> doi), served in Bangladeshi dishes.
 - Draw NO text of any kind. Every sign, label or lettered surface comes back blank and clean \
 — the text is restored separately afterwards.
 - Draw NO logo, wordmark, emblem, crest or institutional mark, and never invent or substitute \
@@ -225,12 +294,16 @@ _CLASSIFY_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "is_logo": {"type": "BOOLEAN"},
+        "logo_fills_image": {"type": "BOOLEAN"},
         "needs_localization": {"type": "BOOLEAN"},
         "categories": {"type": "ARRAY", "items": {"type": "STRING", "enum": CATEGORIES}},
         "information_role": {"type": "STRING", "enum": INFORMATION_ROLES},
         "reason": {"type": "STRING"},
     },
-    "required": ["is_logo", "needs_localization", "categories", "information_role", "reason"],
+    "required": [
+        "is_logo", "logo_fills_image", "needs_localization", "categories",
+        "information_role", "reason",
+    ],
 }
 
 
@@ -270,7 +343,14 @@ def classify_image(image_bytes: bytes, mime: str) -> dict:
                     role if role in INFORMATION_ROLES else "referential"
                 )
                 data["is_logo"] = bool(data.get("is_logo"))
-                if data["is_logo"]:
+                # Missing means "the whole image is the mark", which is the safe reading:
+                # a picture wrongly kept whole is un-localized, while one wrongly redrawn
+                # misrepresents a real organisation.
+                data["logo_fills_image"] = bool(data.get("logo_fills_image", True))
+                # Only a picture that IS a mark is taken off the table entirely. One that
+                # merely contains a mark is localized normally, with the mark protected by
+                # detect_logo_regions — see image_processor._decide_from_png.
+                if data["is_logo"] and data["logo_fills_image"]:
                     data["needs_localization"] = False
                     data["categories"] = []
                 return data
@@ -287,6 +367,7 @@ def classify_image(image_bytes: bytes, mime: str) -> dict:
     logger.warning("Classify: giving up — treating image as no-localization")
     return {
         "is_logo": False,
+        "logo_fills_image": True,
         "needs_localization": False,
         "categories": [],
         "information_role": "referential",
@@ -328,42 +409,105 @@ _TEXT_BLOCKS_PROMPT = (
 )
 
 
-def _extract_text_blocks(image_bytes: bytes, mime: str) -> list[dict]:
-    """Structured OCR: return a list of {"text", "lang", "bbox": [x0,y0,x1,y1]} blocks, with bbox
-    normalized to 0..1 of image dimensions. Returns [] on no-text or any failure (text overlay is
-    then simply skipped and the original/blank surface is kept).
+# OCR retry budget. Deliberately small and time-boxed: vertex_client already backs off five
+# times inside every one of these attempts, and the failure being retried is a 504 on a large
+# payload, which more identical requests cannot fix. Three attempts at a 90s ceiling bounds a
+# hopeless picture at ~5 minutes instead of the hour that five attempts at the 180s default
+# would have cost — on the eatwell plate, measured.
+OCR_ATTEMPTS = 3
+OCR_TIMEOUT_MS = 90_000
+# Longest edge of the copy sent on each successive attempt.
+OCR_RETRY_DIMS = (None, 1024, 768)
+
+
+def _shrunk_for_retry(image_bytes: bytes, mime: str, attempt: int) -> tuple[bytes, str]:
+    """The copy to send on `attempt`: the original first, then progressively smaller ones.
+
+    Returns the bytes unchanged if no resize is wanted or possible, so a failure to shrink
+    costs an ordinary retry rather than the whole OCR.
     """
-    part = types.Part.from_bytes(data=image_bytes, mime_type=mime)
+    target = OCR_RETRY_DIMS[min(attempt, len(OCR_RETRY_DIMS)) - 1]
+    if not target:
+        return image_bytes, mime
     try:
-        response = generate_content(
-            model=CLASSIFY_MODEL,
-            contents=[_TEXT_BLOCKS_PROMPT, part],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=_TEXT_BLOCKS_SCHEMA,
-                temperature=0.0,
-            ),
-        )
-        data = json.loads(response.text)
-        blocks = data.get("blocks", []) if isinstance(data, dict) else []
-        cleaned: list[dict] = []
-        for b in blocks:
-            text = (b.get("text") or "").strip()
-            bbox = b.get("bbox") or []
-            if not text or len(bbox) != 4:
-                continue
-            # Clamp to [0,1] and ensure a valid, non-empty rect.
-            x0, y0, x1, y1 = (min(max(float(v), 0.0), 1.0) for v in bbox)
-            if x1 <= x0 or y1 <= y0:
-                continue
-            cleaned.append({
-                "text": text,
-                "lang": (b.get("lang") or "").strip().lower(),
-                "bbox": [x0, y0, x1, y1],
-            })
-        return cleaned
+        from io import BytesIO
+
+        from PIL import Image
+
+        with Image.open(BytesIO(image_bytes)) as img:
+            img = img.convert("RGB")
+            if max(img.size) <= target:
+                return image_bytes, mime
+            img.thumbnail((target, target), Image.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+        logger.info("OCR retry %d: resending at %dpx", attempt, target)
+        return buf.getvalue(), "image/png"
     except Exception:
-        logger.debug("Could not extract text blocks from image", exc_info=True)
+        logger.debug("Could not shrink the image for an OCR retry", exc_info=True)
+        return image_bytes, mime
+
+
+def _extract_text_blocks(image_bytes: bytes, mime: str, notes: dict | None = None) -> list[dict]:
+    """Structured OCR: return a list of {"text", "lang", "bbox": [x0,y0,x1,y1]} blocks, with bbox
+    normalized to 0..1 of image dimensions.
+
+    Retried, because the one thing this must not do is confuse "no text" with "the request
+    failed". Both used to return [] on a single attempt with the reason logged at debug level,
+    so a transient error on a picture full of labels read as a picture with no labels — and
+    since the edit model is separately told to blank every text surface, the words were then
+    deleted rather than translated. That is what happened to the eatwell plate's food-group
+    labels: regenerated correctly, captions gone, nothing in the log.
+
+    Pass `notes` to tell the two apart: on total failure it gets "ocr_failed": True, and the
+    caller can decline to blank a picture whose words it could not read.
+    """
+    for attempt in range(1, OCR_ATTEMPTS + 1):
+        # Retrying the identical request is the one thing that does not work here: the
+        # failure on the biggest pictures is a server-side 504, and the payload is why. Each
+        # retry hands over a smaller copy, which is also the cheaper request to serve.
+        payload, part_mime = _shrunk_for_retry(image_bytes, mime, attempt)
+        try:
+            response = generate_content(
+                model=CLASSIFY_MODEL,
+                contents=[
+                    _TEXT_BLOCKS_PROMPT,
+                    types.Part.from_bytes(data=payload, mime_type=part_mime),
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=_TEXT_BLOCKS_SCHEMA,
+                    temperature=0.0,
+                ),
+                timeout_ms=OCR_TIMEOUT_MS,
+            )
+            data = json.loads(response.text)
+            blocks = data.get("blocks", []) if isinstance(data, dict) else []
+            cleaned: list[dict] = []
+            for b in blocks:
+                text = (b.get("text") or "").strip()
+                bbox = b.get("bbox") or []
+                if not text or len(bbox) != 4:
+                    continue
+                # Clamp to [0,1] and ensure a valid, non-empty rect.
+                x0, y0, x1, y1 = (min(max(float(v), 0.0), 1.0) for v in bbox)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                cleaned.append({
+                    "text": text,
+                    "lang": (b.get("lang") or "").strip().lower(),
+                    "bbox": [x0, y0, x1, y1],
+                })
+            return cleaned
+        except Exception as exc:
+            logger.warning(
+                "Text-block OCR attempt %d/%d failed: %s",
+                attempt, OCR_ATTEMPTS, str(exc)[:200],
+            )
+    logger.error("Text-block OCR failed after %d attempts — the image's words are unknown",
+                 OCR_ATTEMPTS)
+    if notes is not None:
+        notes["ocr_failed"] = True
     return []
 
 
@@ -400,7 +544,14 @@ _LOGO_REGIONS_PROMPT = (
     "[x0, y0, x1, y1], each value a fraction between 0 and 1 of the image width/height "
     "(x0,y0 = top-left, x1,y1 = bottom-right). Draw the box tightly around the mark itself, "
     "including its wording, and nothing else. Return an empty list if there are none. Do not "
-    "report ordinary headings, captions, body text or page furniture as logos."
+    "report ordinary headings, captions, body text or page furniture as logos.\n"
+    "A mark identifies an ORGANISATION. A slogan, motto or message lettered onto something "
+    "inside a picture — words on a character's t-shirt, a hand-written sign, a placard, a "
+    "poster, a banner — is not a mark unless an organisation's name or emblem is part of it. "
+    "'HELP YOURSELF TO A HEALTHY FUTURE' hand-lettered on a cartoon figure's shirt is a "
+    "message to the reader and must NOT be reported; the same shirt carrying 'NHS Lothian' "
+    "or a charity's crest must be. Reporting a slogan as a mark takes it out of translation "
+    "and deletes it from the page, so when the words name no organisation, leave them out."
 )
 
 
@@ -495,6 +646,156 @@ def _translate_to_bangla(text: str) -> str:
     return text
 
 
+def _keeps_numbers(source: str, translated: str) -> bool:
+    """True if every run of digits in the source survives into the translation.
+
+    The one check worth making automatically: this booklet keeps its numbers in Latin digits
+    (see translator.SYSTEM_PROMPT, "Leave unchanged: numbers, dates"), so a translation that
+    dropped one is detectable without knowing any Bangla. "3 units" -> "তিন" fails here, and
+    that exact answer shipped on the alcohol-units grid: a card that defines a measure, with
+    the measure gone.
+    """
+    return all(run in translated for run in re.findall(r"\d+(?:[.,]\d+)?", source))
+
+
+_BLOCK_TRANSLATION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "translations": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "index": {"type": "INTEGER"},
+                    "bn": {"type": "STRING"},
+                },
+                "required": ["index", "bn"],
+            },
+        }
+    },
+    "required": ["translations"],
+}
+
+_BLOCK_TRANSLATION_PROMPT = """This picture is printed in a health booklet that is being \
+republished in Bangladesh. Below is every piece of text printed in it, numbered. Translate \
+each one into natural, everyday Bangla for a Bangladeshi patient.
+
+Look at the picture before you answer. It tells you what each piece of text is doing: a \
+heading, a caption under a drawing, the name of a food group, a figure printed beside the \
+thing it measures.
+
+Rules:
+- Return one entry for every index, with the same index numbers. Never merge two entries, \
+never split one, never leave one out.
+- KEEP EVERY NUMBER, UNIT, MEASURE AND SYMBOL. "3 units" is "3 ইউনিট", not "তিন". \
+"250ml", "12%", "1.5", "80g", "(125ml, ABV 12%)" — the quantity AND its unit both come \
+through, written the way they are printed, in the same Latin digits the rest of the booklet \
+uses. A number that has lost its unit is a clinical error in this document.
+- Translate the whole of a block, including anything inside brackets.
+- These blocks all belong to ONE picture. Translate a word that appears in several of them \
+the same way every time, and give sibling labels the same style and register — a row of \
+tiles has to read as a row.
+- An organisation's name, a brand, a drug name or a person's name stays in Latin script.
+- Return only the Bangla. No English, no explanation, no quotation marks.
+{context_clause}
+The text blocks:
+{listing}"""
+
+
+def translate_blocks(
+    image_bytes: bytes,
+    mime: str,
+    blocks: list[dict],
+    page_context: str = "",
+) -> int:
+    """Fill each block's "bn" with its Bangla, in one call that can see the picture.
+
+    Replaces one call per block. The per-block call could not see what it was translating:
+    "3 units" came back as "তিন" because nothing in the request said the words were a
+    quantity printed beside the drink it measures, and eight tiles of one grid were eight
+    separate conversations, so they came back in different registers and most of them not at
+    all. One call, with the image and all of the blocks, fixes both — the model sees which
+    label is a heading and which is a figure, and it sees its own siblings.
+
+    Returns how many blocks were translated. A block whose answer fails validation is left
+    without a "bn", so `resolve_block_text` falls back to the per-block call and then to the
+    English: nothing depends on this succeeding.
+    """
+    pending = [
+        (i, (b.get("text") or "").strip())
+        for i, b in enumerate(blocks)
+        # Nothing to do for a block that is already Bangla, or that a previous call has
+        # already answered — the discard path reaches this twice for the same blocks.
+        if not _is_valid_bangla((b.get("bn") or "").strip())
+    ]
+    pending = [(i, t) for i, t in pending if t and not _is_valid_bangla(t)]
+    if not pending:
+        return 0
+
+    context_clause = ""
+    if page_context.strip():
+        context_clause = (
+            f'\nThe page this picture sits on says: "{page_context.strip()}"\n'
+            "Use it only to understand what the words mean. Do not translate it, and do not "
+            "add any of it to your answers.\n"
+        )
+
+    done = 0
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        if not pending:
+            break
+        listing = "\n".join(f"{i}. {text}" for i, text in pending)
+        try:
+            response = generate_content(
+                model=TEXT_TRANSLATE_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime),
+                    _BLOCK_TRANSLATION_PROMPT.format(
+                        context_clause=context_clause, listing=listing
+                    ),
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.0 + 0.2 * (attempt - 1),
+                    response_mime_type="application/json",
+                    response_schema=_BLOCK_TRANSLATION_SCHEMA,
+                ),
+            )
+            answers = json.loads(response.text).get("translations", [])
+        except Exception as exc:
+            logger.warning(
+                "Batch block translation attempt %d failed: %s", attempt, str(exc)[:200]
+            )
+            continue
+
+        by_index = {int(a.get("index", -1)): (a.get("bn") or "").strip() for a in answers}
+        still: list[tuple[int, str]] = []
+        for i, text in pending:
+            bn = by_index.get(i, "")
+            # A block with no letters at all ("12%", "1.5") has nothing to translate into
+            # Bangla script, so for those the digits surviving IS the whole test.
+            has_letters = any(ch.isalpha() for ch in text)
+            ok = bool(bn) and _keeps_numbers(text, bn) and (_is_valid_bangla(bn) or not has_letters)
+            if ok:
+                blocks[i]["bn"] = bn
+                done += 1
+            else:
+                still.append((i, text))
+        if len(still) == len(pending):
+            logger.warning(
+                "Batch block translation attempt %d validated nothing (%d block(s))",
+                attempt, len(pending),
+            )
+        pending = still
+
+    if pending:
+        logger.info(
+            "%d of %d text block(s) fell back to per-block translation: %s",
+            len(pending), len(pending) + done,
+            "; ".join(t[:30] for _, t in pending[:3]),
+        )
+    return done
+
+
 def resolve_block_text(block: dict) -> str:
     """Return the text to render for an OCR block: keep it as-is if it is already Bangla,
     otherwise translate it. Returns "" only for an empty block.
@@ -507,6 +808,11 @@ def resolve_block_text(block: dict) -> str:
     text = (block.get("text") or "").strip()
     if not text:
         return ""
+    # Already done by the image-aware batch call, which is the better answer because it saw
+    # the picture and the block's siblings. image_regen never sets this, so it is unaffected.
+    pre = (block.get("bn") or "").strip()
+    if pre and _is_valid_bangla(pre):
+        return pre
     lang = (block.get("lang") or "").lower()
     if lang.startswith("bn") or _is_valid_bangla(text):
         return text  # already Bangla — keep exactly
@@ -524,6 +830,7 @@ def localize_image(
     page_context: str = "",
     palette: str = "",
     mode: str = "context",
+    notes: dict | None = None,
 ) -> bytes | None:
     """Return edited image bytes adapted to Bangladeshi culture, or None on failure.
 
@@ -537,6 +844,9 @@ def localize_image(
 
     `mode` is "context" (the page's own words steer what is drawn) or "simple" (a compact
     cultural swap with no page text). See LOCALIZE_MODES for when each applies.
+
+    `notes` is a dict the failure reason is written into — pass the caller's audit record so
+    that a picture lost to quota is distinguishable from one the model refused.
 
     None means the caller keeps the original image untouched.
     """
@@ -562,7 +872,7 @@ def localize_image(
             context_clause=CONTEXT_CLAUSE.format(context=context),
         )
 
-    return _run_edit_models(instruction, image_bytes, mime)
+    return _run_edit_models(instruction, image_bytes, mime, notes)
 
 
 def localize_cover(
@@ -586,49 +896,108 @@ def localize_cover(
     return _run_edit_models(instruction, image_bytes, mime)
 
 
-def _run_edit_models(instruction: str, image_bytes: bytes, mime: str) -> bytes | None:
-    """Send one edit instruction down the model fallback chain; return image bytes or None."""
+def _run_edit_models(
+    instruction: str, image_bytes: bytes, mime: str, notes: dict | None = None
+) -> bytes | None:
+    """Send one edit instruction down the model fallback chain; return image bytes or None.
+
+    `notes` is written into rather than returned — the caller passes its own audit record, so
+    why an edit failed lands in the audit with no extra plumbing. Sets "edit_error" to
+    "quota", "refused" or "error", and "edit_attempts" to the number of requests made.
+    """
     part = types.Part.from_bytes(data=image_bytes, mime_type=mime)
     contents = [instruction, part]
+    attempts = 0
+    outcome = "error"
 
     # Walk the model fallback chain: try each edit model a couple of times before moving on. This
     # is the recovery path when the primary image model is rate-limited (429) or unavailable —
     # transient backoff is already handled inside vertex_client.generate_content.
-    for model in EDIT_MODELS:
-        for attempt in range(1, EDIT_ATTEMPTS_PER_MODEL + 1):
-            temperature = 0.2 + (attempt - 1) * 0.3  # 0.2, 0.5, ...
-            try:
-                logger.info("Image generation: model=%s attempt %d/%d (temp=%.1f)",
-                            model, attempt, EDIT_ATTEMPTS_PER_MODEL, temperature)
-                response = generate_content(
-                    model=model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        temperature=temperature,
-                    ),
-                    # Image generation is legitimately slower than text; give it a wider
-                    # ceiling than the client-level default so a real render isn't aborted.
-                    timeout_ms=IMAGE_TIMEOUT_MS,
-                )
-                out = _first_image_bytes(response)
-                if out:
-                    logger.info("Image generation succeeded with %s on attempt %d", model, attempt)
-                    return out
-                logger.warning(
-                    "Localize: no image from %s (attempt %d/%d, temp=%.1f)",
-                    model, attempt, EDIT_ATTEMPTS_PER_MODEL, temperature,
-                )
-                _log_response_diagnostics(response, attempt)
-            except Exception as e:
-                logger.warning(
-                    "Localize request failed on %s (attempt %d/%d, temp=%.1f): %s",
-                    model, attempt, EDIT_ATTEMPTS_PER_MODEL, temperature, str(e)[:200],
-                )
-        logger.info("Localize: model %s exhausted; trying next fallback model", model)
+    #
+    # Then walk the whole chain again, because a picture that failed only because the project
+    # was out of quota is not a picture that cannot be localized, and shipping it untouched is
+    # exactly the failure this pipeline exists to prevent. By this point vertex_client has
+    # already backed off five times and tried both projects, so the only thing left to change
+    # is the wait: the image quota is per-MINUTE and shared by every image model, so a pause
+    # longer than a minute is the one thing that can actually clear it. Only retried when
+    # every failure in the pass was transient — a model that refused will refuse again.
+    for extra_pass in range(EDIT_QUOTA_RETRY_PASSES + 1):
+        if extra_pass:
+            logger.info(
+                "Localize: every model was rate-limited; waiting %.0fs for the per-minute "
+                "image quota to refill (pass %d of %d)",
+                EDIT_QUOTA_COOLDOWN_SEC, extra_pass, EDIT_QUOTA_RETRY_PASSES,
+            )
+            time.sleep(EDIT_QUOTA_COOLDOWN_SEC)
+        all_transient = True
+        for model in EDIT_MODELS:
+            for attempt in range(1, EDIT_ATTEMPTS_PER_MODEL + 1):
+                temperature = 0.2 + (attempt - 1) * 0.3  # 0.2, 0.5, ...
+                attempts += 1
+                try:
+                    logger.info("Image generation: model=%s attempt %d/%d (temp=%.1f)",
+                                model, attempt, EDIT_ATTEMPTS_PER_MODEL, temperature)
+                    response = generate_content(
+                        model=model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["IMAGE"],
+                            temperature=temperature,
+                        ),
+                        # Image generation is legitimately slower than text; give it a wider
+                        # ceiling than the client-level default so a real render isn't aborted.
+                        timeout_ms=IMAGE_TIMEOUT_MS,
+                    )
+                    out = _first_image_bytes(response)
+                    if out:
+                        logger.info(
+                            "Image generation succeeded with %s on attempt %d", model, attempt
+                        )
+                        if notes is not None:
+                            notes["edit_attempts"] = attempts
+                        return out
+                    logger.warning(
+                        "Localize: no image from %s (attempt %d/%d, temp=%.1f)",
+                        model, attempt, EDIT_ATTEMPTS_PER_MODEL, temperature,
+                    )
+                    _log_response_diagnostics(response, attempt)
+                    # A response that came back without an image is a refusal, not a queue.
+                    all_transient = False
+                    outcome = "refused"
+                except Exception as e:
+                    logger.warning(
+                        "Localize request failed on %s (attempt %d/%d, temp=%.1f): %s",
+                        model, attempt, EDIT_ATTEMPTS_PER_MODEL, temperature, str(e)[:200],
+                    )
+                    if _is_quota_error(e):
+                        if outcome != "refused":
+                            outcome = "quota"
+                    else:
+                        all_transient = False
+                        outcome = "refused" if outcome == "refused" else "error"
+            logger.info("Localize: model %s exhausted; trying next fallback model", model)
+        if not all_transient:
+            break  # a refusal will not become an acceptance by waiting
 
-    logger.warning("Localize: all edit models failed — keeping original image")
+    logger.warning(
+        "Localize: all edit models failed after %d request(s) (%s) — keeping original image",
+        attempts, outcome,
+    )
+    if notes is not None:
+        notes["edit_error"] = outcome
+        notes["edit_attempts"] = attempts
     return None
+
+
+# Markers of a "come back later" failure, as opposed to a refusal. Mirrors
+# vertex_client._TRANSIENT_MARKERS, kept short here because only the quota case earns a wait.
+_QUOTA_MARKERS = ("resource_exhausted", "429", "quota", "rate limit", "unavailable", "503")
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """True if an edit failure is a rate limit rather than a refusal."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _QUOTA_MARKERS)
 
 
 def _first_image_bytes(response) -> bytes | None:

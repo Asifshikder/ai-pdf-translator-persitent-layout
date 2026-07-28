@@ -47,13 +47,31 @@ logger = logging.getLogger(__name__)
 REGEN_SUFFIX = "_regen.pdf"  # keep in sync with MODES.regenerate.suffix in static/index.html
 
 CLASSIFY_MODEL = "gemini-2.5-flash"
-# Image models tried in order. If the primary is rate-limited or refuses, the next one is an
-# independent path — transient 429/503 backoff itself is handled inside vertex_client.
-EDIT_MODELS = ["gemini-2.5-flash-image", "gemini-3.1-flash-lite-image", "gemini-3.1-flash-image"]
+# Image models tried in order. Ordered by measured *fidelity of framing*, not by tier, because
+# this pipeline measures OCR boxes on the original and paints Bangla into the regenerated copy —
+# so a model that reframes the picture puts that text off its sign. Measured on the cover figure
+# of the Heart Failure manual (a person holding a blank placard), placard position after
+# regeneration vs. before:
+#
+#   gemini-3.1-flash-lite-image   IoU 0.95   aspect drift 0.04%   ~9s
+#   gemini-2.5-flash-image        IoU 0.72   aspect drift 2.95%   ~14s   (snaps to a 2:3 bucket)
+#   gemini-3.1-flash-image        IoU 0.68   aspect drift 0.04%   ~19s
+#   gemini-3-pro-image            IoU 0.60   aspect drift 1.08%   ~51s   (reinterprets the most)
+#
+# Note the fallback chain does NOT buy quota: the image quota is per-project and shared across
+# every image model, so a 429 on one is a 429 on all of them (measured — see CONCURRENT_IMAGES).
+# The chain is only useful when a model *refuses* a particular picture.
+EDIT_MODELS = ["gemini-3.1-flash-lite-image", "gemini-2.5-flash-image", "gemini-3.1-flash-image"]
 EDIT_ATTEMPTS_PER_MODEL = 2
 
 # 2, not more: the image model's requests-per-minute limit is what produces 429s, and more
 # workers simply spend the retry budget faster.
+#
+# Measured on this project: the limit is per-MINUTE, not per-concurrent-request, and it is
+# shared by every image model. Six requests fired one at a time, never overlapping, still got
+# two successes and four instant (1s) RESOURCE_EXHAUSTED refusals — so the ceiling is roughly
+# two image generations a minute whatever the concurrency. Lowering this number therefore does
+# not avoid 429s; only a quota increase, more projects, or fewer images does.
 CONCURRENT_IMAGES = 2
 
 MODEL_MAX_DIM = 1536  # longest side of the copy sent to the model

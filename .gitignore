@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Per-run image localization audits (image_processor.AUDIT_DIR)
+Output/localize_audit_*.json
+Output/localize_debug/

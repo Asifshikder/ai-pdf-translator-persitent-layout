@@ -579,6 +579,124 @@ def test_text_may_still_grow_on_its_backdrop():
     )
 
 
+def _justified_line(page, words, x0, x1, y, size):
+    """Draw one justified line: `words` spread so the line fills x0..x1 exactly."""
+    widths = [fitz.get_text_length(w, fontname="helv", fontsize=size) for w in words]
+    gap = (x1 - x0 - sum(widths)) / (len(words) - 1)
+    x = x0
+    for word, width in zip(words, widths):
+        page.insert_text((x, y), word, fontsize=size)
+        x += width + gap
+    return gap
+
+
+def test_justified_line_is_not_read_as_table_columns():
+    """A justified line's words must come back as one segment, not one each.
+
+    Real geometry from p.147 of the Post-MI manual. "One particular type of" is
+    the opening line of a paragraph set justified in a 154pt column, so its
+    three spaces are stretched to 13.3pt — past COLUMN_GAP_MIN. PyMuPDF hands
+    each word over as its own line, `_rows` puts them back on one row, and the
+    column test then cut the line into four cells.
+
+    Every one of them was a defect on its own: "One" and "type" were sent to the
+    translator with no sentence around them, and each was then planned as a
+    standalone label with `10 * size` of room to grow into — straight across the
+    paragraph they came from. Three of the four ended up drawn on top of it.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=654.283, height=900.898)
+    left, right, size = 416.0, 570.2, 11.0
+    gap = _justified_line(page, ["One", "particular", "type", "of"], left, right, 251.3, size)
+    # The rest of the paragraph: ordinary lines, flush with the same right edge.
+    for text, y in (("breathlessness requires a little", 266.3),
+                    ("more explanation. It is called", 281.3)):
+        width = fitz.get_text_length(text, fontname="helv", fontsize=size)
+        page.insert_text((right - width, y), text, fontsize=size)
+
+    segments, kept = _extract_segments(page, _vector_marks(page))
+    _plan_insert_rects(page, segments, kept, _rules(page), _panels(page))
+    stray = [t for t in texts(segments) if t in ("One", "particular", "type", "of")]
+    whole = [t for t in texts(segments) if t.startswith("One particular type of")]
+    doc.close()
+
+    check(
+        f"a justified line ({gap:.1f}pt word gaps) is not cut into cells",
+        not stray,
+        f"words stranded as their own segments: {stray}",
+    )
+    check(
+        "…and its words are rejoined into the sentence they came from",
+        bool(whole),
+        f"segments: {texts(segments)[:4]}",
+    )
+
+
+def test_table_row_still_splits_into_cells():
+    """The other half of the same rule: a real table row must still split.
+
+    Two rows of a day planner, with the same kind of gap the justified line
+    above has. What tells them apart is that a table's rows end wherever their
+    last cell ends, so they are not all set to the full measure.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=595.276, height=841.89)
+    for label, activity, y in (("Monday", "Go to the library", 300.0),
+                               ("Tuesday", "Buy a new shirt and a hat", 316.0)):
+        page.insert_text((100.0, y), label, fontsize=11)
+        page.insert_text((160.0, y), activity, fontsize=11)
+
+    segments, _ = _extract_segments(page, _vector_marks(page))
+    doc.close()
+    fused = [t for t in texts(segments) if "Monday" in t and "library" in t]
+    check(
+        "a table row's cells are still separate segments",
+        not fused,
+        f"cells fused into one segment: {fused}",
+    )
+
+
+def test_growth_does_not_cross_a_neighbour():
+    """Two boxes must not meet in the white space between them.
+
+    Real geometry from the top of a Post-MI chapter page: the chapter title
+    grows 280pt to its right at the same time as the running head beside it
+    grows a line down, and they cross in a gap that neither had reached when it
+    was planned. Each was measured only against where the other's *source* text
+    sat, so neither saw it coming.
+
+    The baselines are set so the two line boxes graze by well under a point, as
+    the real ones do (0.77pt). That is what hides them from each other: both the
+    horizontal and the vertical obstacle test want more than a point of overlap
+    on the other axis before they treat a neighbour as being in the way, and
+    below that threshold each box is free to grow across the other.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=654.283, height=900.898)
+    page.insert_text((87.2, 115.0), "Hyperventilation", fontsize=28)
+    page.insert_text((428.1, 81.0), "Hyperventilation", fontsize=15.6)
+
+    segments, kept = _extract_segments(page, _vector_marks(page))
+    _plan_insert_rects(page, segments, kept, _rules(page), _panels(page))
+    boxes = [(fitz.Rect(s["rect"]), fitz.Rect(s["insert_rect"])) for s in segments]
+    doc.close()
+
+    if len(boxes) != 2:
+        check("running-head fixture builds", False, f"{len(boxes)} segments, expected 2")
+        return
+    (src_a, ins_a), (src_b, ins_b) = boxes
+    check(
+        "growth does not run one box into the box beside it",
+        (ins_a & ins_b).is_empty and (src_a & src_b).is_empty,
+        f"{ins_a} overlaps {ins_b} (sources {src_a} and {src_b} did not)",
+    )
+    check(
+        "…and each box still gets room to grow",
+        ins_a.x1 > src_a.x1 + 1 and ins_b.y1 > src_b.y1 + 1,
+        f"a: {src_a} -> {ins_a}; b: {src_b} -> {ins_b}",
+    )
+
+
 def test_sample_pdf_regressions(doc):
     """The previously-working sample must not regress.
 
@@ -675,9 +793,14 @@ def main() -> int:
     else:
         skipped.append(f"{ARTWORK_PDF} not found")
 
+    print("\nJustified text vs table columns")
+    test_justified_line_is_not_read_as_table_columns()
+    test_table_row_still_splits_into_cells()
+
     print("\nText growth around pictures")
     test_text_does_not_grow_onto_a_picture()
     test_text_may_still_grow_on_its_backdrop()
+    test_growth_does_not_cross_a_neighbour()
 
     print("\nBangla line spacing")
     test_bangla_lines_do_not_collide()

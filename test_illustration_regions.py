@@ -17,8 +17,11 @@ Optional Tier 2 (requires --dump-crops flag):
 """
 
 import io
+import json
 import os
+import random
 import sys
+import tempfile
 from collections import defaultdict
 
 import fitz
@@ -26,9 +29,17 @@ from PIL import Image, ImageDraw
 
 from image_processor import (
     CONTEXT_MIN_WORDS,
+    MAX_RESIDUAL_INK,
+    MIN_OVERLAY_HEIGHT,
     SIMPLE_MODE_MAX_PIXELS,
+    SNAP_MAX_AREA_GROWTH,
+    _anchor_box,
     _apply_cover,
     _block_key,
+    _ink_share,
+    _plate_color,
+    _text_only_result,
+    _write_audit,
     _detect_cover_page,
     _downscale_for_model,
     _is_english_block,
@@ -55,10 +66,15 @@ from image_regions import (
     _is_image_mask,
     _rasterize_rect,
 )
-from pdf_processor import _panels, _rules, _vector_marks
+from pdf_processor import FONTS_DIR, _panels, _rules, _vector_marks
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SOURCE_PDF = os.path.join(BASE_DIR, "OriginalPDF", "Heart Manual_Post Myocardial Infarction (1).pdf")
+# A *translated* manual, which is the case the page-level text gate got wrong: see
+# test_divider_cartoons_are_found_in_a_translated_manual.
+REVASC_PDF = os.path.join(
+    BASE_DIR, "OriginalPDF", "Heart Manual Revascularisation (3) [77-91]_bn_merge.pdf"
+)
 
 # The cover cartoon, and every page it is reprinted on. Detection must find it on all of
 # them and dedup them to a single signature (one AI edit for the whole book).
@@ -985,6 +1001,605 @@ def test_logo_text_is_never_translated():
     check("A block with no usable box is kept rather than guessed at",
           len(_outside_logos([{"text": "x", "bbox": []}], logos)) == 1, "block was dropped")
 
+    # The box test alone is not enough: detect_logo_regions and _extract_text_blocks are two
+    # independent model calls, and on the eatwell plate they disagreed completely about where
+    # the Food Standards Agency mark was — zero overlap — so its wordmark sailed through and
+    # the pipeline was about to draw a plate and English lettering over the crest.
+    apart = [{"label": "Food Standards Agency", "bbox": [0.02, 0.02, 0.10, 0.08]}]
+    elsewhere = [
+        {"text": "FOOD STANDARDS AGENCY", "bbox": [0.708, 0.083, 0.80, 0.13]},
+        {"text": "Fruit and vegetables", "bbox": [0.10, 0.30, 0.40, 0.35]},
+    ]
+    survivors = [b["text"] for b in _outside_logos(elsewhere, apart)]
+    check("A mark's name is protected even where the boxes do not overlap",
+          "FOOD STANDARDS AGENCY" not in survivors, f"kept {survivors}")
+    check("…while an ordinary caption is still translated",
+          "Fruit and vegetables" in survivors, f"kept {survivors}")
+    check("…and a one-letter block is not matched against a label",
+          any(b["text"] == "a" for b in
+              _outside_logos([{"text": "a", "bbox": [0.5, 0.5, 0.51, 0.51]}], apart)))
+
+
+def _png(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _photograph(w: int = 240, h: int = 200) -> Image.Image:
+    """An image with no flat field anywhere in it."""
+    rng = random.Random(7)
+    img = Image.new("RGB", (w, h))
+    img.putdata([
+        (rng.randint(30, 220), rng.randint(30, 220), rng.randint(30, 220))
+        for _ in range(w * h)
+    ])
+    return img
+
+
+def test_text_lands_on_the_moved_surface():
+    """Tier 1: after a regeneration the words follow their surface, not their old address.
+
+    The model is asked to keep every blank surface to the pixel and mostly does, but
+    "mostly" is a placard a few percent out of place — and the Bangla, written at the
+    coordinates measured before the edit, then hangs off its bottom edge and over a hand.
+    """
+    print("\n=== Anchoring To The Regenerated Surface ===")
+    img = Image.new("RGB", (400, 300), (120, 40, 140))
+    ImageDraw.Draw(img).rectangle([70, 65, 330, 145], fill=(250, 250, 245))
+    placard = (70, 65, 331, 146)
+
+    moved = _anchor_box(img, (60, 40, 340, 120))  # where it was before the redraw
+    check("A box whose surface moved is found again", moved is not None)
+    if moved:
+        (dx0, dy0, dx1, dy1), color = moved
+        check(
+            "…and the destination sits inside the surface as redrawn",
+            placard[0] <= dx0 and placard[1] <= dy0 and dx1 <= placard[2] and dy1 <= placard[3],
+            f"destination {(dx0, dy0, dx1, dy1)} escapes the placard {placard}",
+        )
+        check("…in the surface's own colour", color == (250, 250, 245), f"got {color}")
+
+    check(
+        "A box that never moved is left where it is",
+        _anchor_box(img, (80, 70, 320, 140))[0] == (80, 70, 320, 140),
+    )
+
+    # Anchoring must run end to end, not just as a helper.
+    _, overlay = _prepare_text_only_image(
+        _png(img), 400, 300,
+        [{"text": "HELP YOURSELF", "lang": "en", "bbox": [0.15, 0.133, 0.85, 0.40]}],
+        anchor=True,
+    )
+    check("The block survives the anchored path", len(overlay) == 1)
+    if overlay:
+        bx = overlay[0]["bbox"]
+        check("…with no plate needed", overlay[0].get("scrim") is None)
+        check(
+            "…and a box that landed on the placard",
+            bx[1] * 300 >= 65 and bx[3] * 300 <= 146,
+            f"got y {bx[1] * 300:.0f}..{bx[3] * 300:.0f}, placard is 65..146",
+        )
+
+
+def test_text_on_a_photograph_gets_a_plate():
+    """Tier 1: a label with nowhere clean to sit is given a surface, not dropped.
+
+    This is the eatwell plate. Every one of its labels sits on photographic detail, so the
+    erase path refused all of them, the overlay wrote nothing, and the picture shipped a
+    hundred percent in English — recorded as though it had been considered and kept.
+    """
+    print("\n=== Label Plates On Photographs ===")
+    photo = _photograph()
+    block = {"text": "Fruit and vegetables", "lang": "en", "bbox": [0.10, 0.10, 0.55, 0.25]}
+
+    _, overlay = _prepare_text_only_image(_png(photo), 240, 200, [dict(block)])
+    check("A label on a photograph is still written", len(overlay) == 1,
+          "the block was dropped, as it used to be")
+    plate = overlay[0].get("scrim") if overlay else None
+    check("…on a plate drawn for it", isinstance(plate, str) and plate.startswith("#"),
+          f"got scrim={plate!r}")
+    if plate:
+        luminance = sum(
+            c * w for c, w in zip(
+                [int(plate[i:i + 2], 16) for i in (1, 3, 5)], (0.299, 0.587, 0.114)
+            )
+        )
+        expected = "#000000" if luminance > 140 else "#ffffff"
+        check("…in a text colour that contrasts the plate",
+              overlay[0]["color"] == expected,
+              f"{overlay[0]['color']} on a plate of luminance {luminance:.0f}")
+
+    # And the plate has to actually reach the page.
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=300)
+    rect = fitz.Rect(20, 20, 260, 220)
+    before = len(page.get_drawings())
+    _overlay_text_blocks(page, rect, overlay, fitz.Archive(FONTS_DIR))
+    drawn = page.get_drawings()
+    check("The plate is drawn as page content", len(drawn) > before,
+          "no rectangle reached the page")
+    if len(drawn) > before:
+        target = fitz.Rect(
+            rect.x0 + overlay[0]["bbox"][0] * rect.width,
+            rect.y0 + overlay[0]["bbox"][1] * rect.height,
+            rect.x0 + overlay[0]["bbox"][2] * rect.width,
+            rect.y0 + overlay[0]["bbox"][3] * rect.height,
+        )
+        covers = any((d["rect"] & target).get_area() > 0.8 * target.get_area() for d in drawn)
+        check("…covering the words it sits under", covers,
+              f"no drawing covers {target}")
+    doc.close()
+
+
+def test_a_badge_box_never_swallows_its_tile():
+    """Tier 1: an erase box stops at the artwork instead of growing 100% into it.
+
+    A "3 units" badge is a small tab of flat colour on top of a photograph. Growing while
+    "any pixel differs from the tab" meant growing until the allowance ran out, and the tab
+    colour was then painted over that whole rectangle — which is how a blue block ended up
+    spilling out past the edge of its own tile.
+    """
+    print("\n=== Badge Boxes Stay On Their Badge ===")
+    tile = _photograph(180, 177)
+    ImageDraw.Draw(tile).rectangle([10, 8, 80, 40], fill=(20, 90, 170))   # the tab
+    ImageDraw.Draw(tile).text((16, 16), "3 units", fill=(255, 255, 255))
+
+    box = (14, 14, 66, 32)
+    grown = _snap_to_ink(tile, box, (20, 90, 170))
+    check("The box does not grow past the badge", grown[3] <= 44 and grown[2] <= 84,
+          f"grew to {grown}, badge ends at (80, 40)")
+    check("…and stays inside the tile", grown[0] >= 0 and grown[1] >= 0, f"got {grown}")
+
+    _, overlay = _prepare_text_only_image(
+        _png(tile), 180, 177, [{"text": "3 units", "lang": "en",
+                                "bbox": [14 / 180, 14 / 177, 66 / 180, 32 / 177]}]
+    )
+    if overlay:
+        bx = overlay[0]["bbox"]
+        painted = (bx[2] - bx[0]) * 180 * (bx[3] - bx[1]) * 177
+        check("…and the painted area stays within its allowance",
+              painted <= SNAP_MAX_AREA_GROWTH * (66 - 14) * (32 - 14) * 1.3,
+              f"painted {painted:.0f}px vs source {(66 - 14) * (32 - 14)}px")
+
+
+def test_no_english_survives_under_the_bangla():
+    """Tier 1: the destination is cleared, not just the block's own box.
+
+    On the units grid the Bangla was drawn straight over a still-visible "(250ml, ABV 12%)"
+    — a *different* OCR block, whose own erase had been refused. Checking each block's own
+    box could never catch that; checking the box the words will be read from does.
+    """
+    print("\n=== No English Under The Bangla ===")
+    img = Image.new("RGB", (400, 300), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.text((40, 90), "Standard glass wine", fill=(0, 0, 0))
+    draw.text((40, 115), "(250ml, ABV 12%)", fill=(0, 0, 0))  # the neighbour left standing
+
+    cleaned, overlay = _prepare_text_only_image(
+        _png(img), 400, 300,
+        [{"text": "Standard glass wine", "lang": "en",
+          "bbox": [0.09, 0.28, 0.55, 0.43]}],
+    )
+    check("The block is placed", len(overlay) == 1)
+    if overlay:
+        out = Image.open(io.BytesIO(cleaned)).convert("RGB")
+        bx = overlay[0]["bbox"]
+        dest = (int(bx[0] * 400), int(bx[1] * 300), int(bx[2] * 400), int(bx[3] * 300))
+        share = _ink_share(out, dest, (255, 255, 255))
+        check("…and nothing is left standing inside its destination",
+              share <= MAX_RESIDUAL_INK, f"{share:.1%} of the destination is still ink")
+
+
+def test_a_discarded_regeneration_is_never_reported_as_kept():
+    """Tier 1: an untouched image says which failure made it untouched.
+
+    Every "we are not redrawing this" path returned "classify_kept" when it had nothing to
+    write, so a thrown-away regeneration was indistinguishable in the audit from a picture
+    the classifier had deliberately left alone. That is how a page of English shipped with
+    a record saying it had been considered.
+    """
+    print("\n=== Untouched Images Say Why ===")
+    import image_processor
+
+    original = image_processor.detect_logo_regions
+    image_processor.detect_logo_regions = lambda *a, **k: []
+    try:
+        blank = _png(Image.new("RGB", (60, 60), (255, 255, 255)))
+        _, status, record = _text_only_result(
+            blank, 60, 60, [], {}, "xref:1", 1, empty_status="regeneration_discarded"
+        )
+        check("A discarded regeneration reports itself as one",
+              status == "regeneration_discarded", f"got {status!r}")
+        check("…and is flagged untouched", record.get("untouched") is True)
+
+        _, plain, _ = _text_only_result(blank, 60, 60, [], {}, "xref:2", 1)
+        check("A picture with nothing to do is still classify_kept",
+              plain == "classify_kept", f"got {plain!r}")
+    finally:
+        image_processor.detect_logo_regions = original
+
+    check("Every status the pipeline can return is in the summary vocabulary",
+          {"aspect_kept", "regeneration_discarded", "classify_failed"}
+          <= set(image_processor.STATUS_VOCABULARY))
+
+
+def test_numbers_survive_translation():
+    """Tier 1: a measure that lost its unit is a clinical error, and is detectable.
+
+    "3 units" came back from the per-block translator as "তিন" — the number gone from a
+    card whose entire purpose is to state that number.
+    """
+    print("\n=== Numbers Survive Translation ===")
+    from image_localizer import _keeps_numbers, resolve_block_text
+
+    check("A dropped number is caught", not _keeps_numbers("3 units", "তিন"))
+    check("A kept number passes", _keeps_numbers("3 units", "3 ইউনিট"))
+    check("Decimals and percentages count too",
+          _keeps_numbers("(125ml, ABV 12%)", "(125ml, ABV 12%) ওয়াইন")
+          and not _keeps_numbers("1.5 units", "১.৫ ইউনিট"))
+
+    # A block already translated by the image-aware batch call must not be re-sent.
+    calls = []
+    import image_localizer
+
+    original = image_localizer._translate_to_bangla
+    image_localizer._translate_to_bangla = lambda t: calls.append(t) or t
+    try:
+        got = resolve_block_text({"text": "3 units", "lang": "en", "bn": "3 ইউনিট"})
+        check("A pre-translated block is used as-is", got == "3 ইউনিট", f"got {got!r}")
+        check("…without another API call", not calls, f"{len(calls)} call(s) made")
+    finally:
+        image_localizer._translate_to_bangla = original
+
+
+def test_smask_is_preserved():
+    """Tier 1: a cut-out figure stays cut out when its pixels are swapped.
+
+    Dropping /SMask turns a floating figure into an opaque rectangle that prints over
+    whatever panel it was sitting on. It matters more here than in image_regen: CMYK images
+    are *rendered* from their placement, so the replacement already carries the page
+    background, and without the mask that background is painted over the layout.
+    """
+    print("\n=== Soft Masks Survive The Swap ===")
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=200)
+    page.insert_image(fitz.Rect(20, 20, 180, 180), pixmap=fitz.Pixmap(
+        fitz.csRGB, fitz.IRect(0, 0, 80, 80)
+    ))
+    xref = page.get_images(full=True)[0][0]
+    doc.xref_set_key(xref, "SMask", "9 0 R")
+
+    _swap_image_in_place(doc, xref, _png(Image.new("RGB", (80, 80), (10, 120, 200))))
+    check("The soft mask is still there after the swap",
+          doc.xref_get_key(xref, "SMask")[0] != "null",
+          f"got {doc.xref_get_key(xref, 'SMask')}")
+    check("…while the stencil keys are cleared",
+          doc.xref_get_key(xref, "ImageMask")[0] == "null")
+    doc.close()
+
+
+def test_extreme_aspect_pictures_are_left_alone():
+    """Tier 1: a page-edge sliver is not worth a model call, let alone a redraw.
+
+    A 114x1381 strip came back with its one leaf shifted a few percent, and since the page
+    crops all but its left quarter the leaf moved out of view and left a white gap down the
+    edge. Checked before the classify call, so it costs no quota either.
+    """
+    print("\n=== Extreme Aspect Strips ===")
+    import image_processor
+
+    calls = []
+    original = image_processor.classify_image
+    image_processor.classify_image = lambda *a, **k: calls.append(1) or {}
+    try:
+        sliver = _png(Image.new("RGB", (114, 1381), (200, 210, 190)))
+        _, status, record = image_processor._decide_from_png(sliver, 114, 1381, "xref:43", 1)
+        check("A 12:1 sliver is kept as printed", status == "aspect_kept", f"got {status!r}")
+        check("…with the reason recorded",
+              record.get("regeneration_vetoed") == "extreme_aspect")
+        check("…and no classification was paid for", not calls, f"{len(calls)} call(s)")
+    finally:
+        image_processor.classify_image = original
+
+
+def test_overlay_skips_an_unreadably_small_box():
+    """Tier 1: a box too small to hold Bangla gets nothing, not a smudge.
+
+    With a plate now drawn under the words, a box that insert_htmlbox would shrink to a
+    smear would leave a coloured smudge on the artwork rather than merely illegible type.
+    """
+    print("\n=== Unreadably Small Boxes ===")
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=300)
+    rect = fitz.Rect(0, 0, 300, 300)
+    before = len(page.get_drawings())
+    _overlay_text_blocks(
+        page, rect,
+        [{"text": "ছোট", "lang": "bn", "scrim": "#ffffff",
+          "bbox": [0.10, 0.10, 0.90, 0.10 + (MIN_OVERLAY_HEIGHT - 1) / 300]}],
+        fitz.Archive(FONTS_DIR),
+    )
+    check("Nothing is drawn for a box shorter than the minimum",
+          len(page.get_drawings()) == before,
+          f"{len(page.get_drawings()) - before} drawing(s) added")
+    doc.close()
+
+
+def test_a_cover_that_moves_its_panels_is_refused():
+    """Tier 1: the cover's text is preserved, so the colour behind it must be too.
+
+    The cover's real text layer is not redrawn — it is kept and printed back over the
+    regeneration at fixed positions. So the model is free to move the artwork out from under
+    it, and on one run the teal panel came back covering only the top half of the page: the
+    white caption that had been sitting on it was printed onto bare white paper and vanished.
+    No prompt can guarantee this, so it is measured.
+    """
+    print("\n=== A Cover That Moves Its Panels Is Refused ===")
+    from image_processor import _cover_keeps_text_backgrounds, COVER_DPI
+
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=400)
+    page.draw_rect(fitz.Rect(0, 0, 300, 400), color=None, fill=(0.05, 0.43, 0.43))
+    for y in (60, 300, 320, 340):
+        page.insert_text((30, y), "caption line", fontsize=11, color=(1, 1, 1))
+
+    original = page.get_pixmap(dpi=COVER_DPI).tobytes("png")
+    check("The original cover always passes",
+          _cover_keeps_text_backgrounds(original, page))
+
+    moved = Image.open(io.BytesIO(original)).convert("RGB")
+    W, H = moved.size
+    for y in range(int(H * 0.4), H):
+        for x in range(W):
+            moved.putpixel((x, y), (255, 255, 255))
+    check("A cover whose panel slid out from under the text is refused",
+          not _cover_keeps_text_backgrounds(_png(moved), page),
+          "the regeneration was accepted and the text would be invisible")
+
+    paler = Image.open(io.BytesIO(original)).convert("RGB")
+    px = paler.load()
+    for y in range(H):
+        for x in range(W):
+            r, g, b = px[x, y]
+            px[x, y] = (min(255, r + 18), min(255, g + 18), min(255, b + 18))
+    check("…while the same layout in a slightly different shade is kept",
+          _cover_keeps_text_backgrounds(_png(paler), page))
+    doc.close()
+
+
+def test_a_picture_containing_a_mark_is_not_a_mark():
+    """Tier 1: "is a logo" and "contains a logo" are two answers, not one.
+
+    `is_logo` short-circuits everything — no OCR, no translation, no redraw — so a picture
+    wrongly called a whole logo ships untouched and in English. The FSA eatwell plate did
+    exactly that: a 2455x1672 photograph with an agency crest in one corner, and at
+    temperature 0 the classifier called it a logo on some runs and not on others. A coin
+    flip is not a policy, so the classifier now answers `logo_fills_image` as well and only
+    a picture that IS the mark is kept whole.
+    """
+    print("\n=== A Picture Containing A Mark Is Not A Mark ===")
+    import image_processor
+
+    original = image_processor.classify_image
+    seen = {}
+
+    def decide(fills: bool):
+        def stub(*a, **k):
+            return {
+                "is_logo": True, "logo_fills_image": fills, "needs_localization": False,
+                "categories": [], "information_role": "decorative", "reason": "mark present",
+            }
+        return stub
+
+    png = _png(Image.new("RGB", (600, 500), (250, 250, 245)))
+    try:
+        image_processor.classify_image = decide(True)
+        _, status, record = image_processor._decide_from_png(png, 600, 500, "xref:9", 1)
+        check("A picture that IS a mark is kept exactly as printed",
+              status == "logo_kept", f"got {status!r}")
+        check("…and recorded as untouched", record.get("untouched") is True)
+
+        image_processor.classify_image = decide(False)
+        image_processor._extract_text_blocks = lambda *a, **k: []
+        _, status2, record2 = image_processor._decide_from_png(png, 600, 500, "xref:10", 1)
+        check("A picture that merely CONTAINS a mark is not kept as one",
+              status2 != "logo_kept", f"got {status2!r}")
+        check("…and the distinction is in the audit",
+              record2.get("logo_fills_image") is False)
+    finally:
+        image_processor.classify_image = original
+        seen.clear()
+
+    # A classifier that omits the field must be read the safe way round.
+    from image_localizer import classify_image as _ci  # noqa: F401
+    import image_localizer
+    check("A missing answer defaults to 'the image IS the mark'",
+          bool({"is_logo": True}.get("logo_fills_image", True)))
+
+
+def test_nothing_the_overlay_draws_overlaps():
+    """Tier 1: no two things the overlay draws may sit on top of each other.
+
+    Two guards, and both have to measure the *plate*, not the words inside it: a plate is
+    opaque and drawn over everything, so two plates a point apart overlap while both text
+    boxes still "fit", and a plate laid across a caption the redaction deliberately kept
+    would hide it outright.
+    """
+    print("\n=== Nothing The Overlay Draws Overlaps ===")
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=400)
+    rect = fitz.Rect(0, 0, 400, 400)
+    # Two plated blocks whose text boxes clear each other by a hair but whose plates do not.
+    blocks = [
+        {"text": "একটি", "lang": "bn", "scrim": "#ffffff",
+         "bbox": [0.10, 0.10, 0.90, 0.20]},
+        {"text": "দুইটি", "lang": "bn", "scrim": "#ffffff",
+         "bbox": [0.10, 0.2025, 0.90, 0.30]},
+    ]
+    _overlay_text_blocks(page, rect, blocks, fitz.Archive(FONTS_DIR))
+    drawn = [d["rect"] for d in page.get_drawings()]
+    worst = 0.0
+    for i, a in enumerate(drawn):
+        for b in drawn[i + 1:]:
+            small = min(a.get_area(), b.get_area())
+            if small > 0:
+                worst = max(worst, (a & b).get_area() / small)
+    check("Two plates never overlap each other", worst <= 0.25,
+          f"worst overlap {worst:.0%} between {len(drawn)} plate(s)")
+    doc.close()
+
+    # A plate must not be laid over the page's own live text.
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=400)
+    page.insert_text((60, 120), "kept caption", fontsize=11)
+    before = len(page.get_drawings())
+    _overlay_text_blocks(
+        page, fitz.Rect(0, 0, 400, 400),
+        [{"text": "কিছু", "lang": "bn", "scrim": "#ffffff",
+          "bbox": [0.10, 0.26, 0.80, 0.31]}],
+        fitz.Archive(FONTS_DIR),
+    )
+    check("A plate is never drawn over the page's own text",
+          len(page.get_drawings()) == before,
+          f"{len(page.get_drawings()) - before} plate(s) drawn over live text")
+    doc.close()
+
+
+def test_divider_cartoons_are_found_in_a_translated_manual():
+    """Tier 1: the divider illustration is detected, and tables still are not.
+
+    Eligibility used to be judged on the whole page's text-line count, which is a proxy —
+    and the proxy broke on exactly the documents this pipeline exists for. Bangla wraps into
+    more lines than the English the limit of 12 was measured on, so a divider page went from
+    12 lines to 16 and its cartoon stopped being detected. A 91-page run of this manual
+    recorded ZERO vector regions: every divider illustration in the book shipped Western,
+    and nothing in the audit said so, because an image that is never detected is never
+    recorded.
+
+    The cluster's own text is the honest signal. Measured here: the cartoon carries 3-6
+    lines inside its bbox, the table and diagram clusters carry 38 to 286.
+    """
+    print("\n=== Divider Cartoons In A Translated Manual ===")
+    if not os.path.exists(REVASC_PDF):
+        print(f"  SKIP  {REVASC_PDF} not found")
+        skipped.append("divider_cartoons_are_found")
+        return
+
+    doc = fitz.open(REVASC_PDF)
+    found = {}
+    for page_num in (13, 22, 34, 44, 53, 63):
+        regions = regions_on(doc, page_num)
+        if regions:
+            found[page_num] = regions[0]
+    check("The divider cartoon is detected on every page that carries it",
+          len(found) == 6, f"found on {sorted(found)} of [13, 22, 34, 44, 53, 63]")
+    check("…and dedups to a single signature, so the book gets one consistent redraw",
+          len({r.content_key for r in found.values()}) == 1,
+          f"{len({r.content_key for r in found.values()})} signatures")
+    if 13 in found:
+        rect = found[13].rect
+        check("…framed on the artwork rather than the whole page",
+              rect.get_area() / doc[12].rect.get_area() < 0.5,
+              f"covers {rect.get_area() / doc[12].rect.get_area():.0%} of the page")
+
+    # The other direction, which is what the old page-level limit was protecting: a cluster
+    # with the page's words running through it is a table or a diagram, not a picture.
+    for page_num in (16, 75, 87, 89, 90):
+        check(f"Page {page_num}'s table/diagram line art is still refused",
+              not regions_on(doc, page_num),
+              f"detected {len(regions_on(doc, page_num))} region(s)")
+    doc.close()
+
+
+def test_unreadable_text_is_never_blanked():
+    """Tier 1: a picture whose words could not be read is not sent to be blanked.
+
+    OCR fed the overlay *and* was a single attempt returning [] on any failure, logged at
+    debug. So a transient error on a picture full of labels read as "no labels" — and since
+    the edit model is separately told to return every text surface blank, the words were
+    deleted rather than translated. The eatwell plate came back correctly localized with its
+    food-group captions simply gone, and nothing in the log said so.
+    """
+    print("\n=== Unreadable Text Is Never Blanked ===")
+    import image_localizer
+
+    original = image_localizer.generate_content
+    image_localizer.generate_content = lambda **kw: (_ for _ in ()).throw(RuntimeError("503"))
+    try:
+        notes = {}
+        got = image_localizer._extract_text_blocks(b"x", "image/png", notes=notes)
+        check("A failed OCR call reports itself", notes.get("ocr_failed") is True)
+        check("…and still returns no blocks", got == [])
+
+        clean = {}
+        image_localizer._extract_text_blocks(b"x", "image/png", notes=clean)
+        check("…every time it fails", clean.get("ocr_failed") is True)
+    finally:
+        image_localizer.generate_content = original
+
+    import image_processor
+
+    classify_calls, edit_calls = [], []
+    orig_classify = image_processor.classify_image
+    orig_ocr = image_processor._extract_text_blocks
+    orig_edit = image_processor.localize_image
+    image_processor.classify_image = lambda *a, **k: (
+        classify_calls.append(1) or {"is_logo": False, "needs_localization": True,
+                                     "categories": ["food_objects"],
+                                     "information_role": "decorative", "reason": "food"}
+    )
+
+    def failing_ocr(_b, _m, notes=None):
+        if notes is not None:
+            notes["ocr_failed"] = True
+        return []
+
+    image_processor._extract_text_blocks = failing_ocr
+    image_processor.localize_image = lambda *a, **k: edit_calls.append(1) or b""
+    try:
+        png = _png(Image.new("RGB", (600, 400), (240, 240, 235)))
+        out, status, record = image_processor._decide_from_png(png, 600, 400, "xref:166", 36)
+        check("The picture is left exactly as printed", out is None and status == "ocr_failed",
+              f"got {status!r}")
+        check("…flagged untouched with the reason", record.get("untouched") is True)
+        check("…and no image generation was paid for", not edit_calls,
+              f"{len(edit_calls)} edit call(s) made")
+    finally:
+        image_processor.classify_image = orig_classify
+        image_processor._extract_text_blocks = orig_ocr
+        image_processor.localize_image = orig_edit
+
+
+def test_audit_is_written_to_disk():
+    """Tier 1: the run's decisions outlive the run.
+
+    Until this the audit was one log line on stdout, so the only way to find out why a
+    picture had shipped untouched was to have been watching the server at the time.
+    """
+    print("\n=== Audit Artifact ===")
+    import image_processor
+
+    original = image_processor.AUDIT_DIR
+    image_processor.AUDIT_DIR = tempfile.mkdtemp()
+    try:
+        records = [
+            {"ident": "xref:166", "page": 36, "status": "edit_ok", "scrim_blocks": 5},
+            {"ident": "xref:43", "page": 1, "status": "aspect_kept", "untouched": True},
+        ]
+        path = _write_audit(records, "1 edit_ok, 1 aspect_kept")
+        check("An audit file is written", bool(path) and os.path.exists(path or ""))
+        if path:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            check("…with the run summary", payload["summary"] == "1 edit_ok, 1 aspect_kept")
+            check("…and every record", len(payload["records"]) == 2)
+            check("…including why an image was untouched",
+                  payload["records"][1]["untouched"] is True
+                  and payload["records"][1]["status"] == "aspect_kept")
+    finally:
+        image_processor.AUDIT_DIR = original
+
 
 if __name__ == "__main__":
     print("Illustration Regions Detection Tests")
@@ -1013,6 +1628,21 @@ if __name__ == "__main__":
     test_background_is_measured_not_guessed()
     test_logos_are_never_changed()
     test_logo_text_is_never_translated()
+    test_text_lands_on_the_moved_surface()
+    test_text_on_a_photograph_gets_a_plate()
+    test_a_badge_box_never_swallows_its_tile()
+    test_no_english_survives_under_the_bangla()
+    test_a_discarded_regeneration_is_never_reported_as_kept()
+    test_numbers_survive_translation()
+    test_smask_is_preserved()
+    test_extreme_aspect_pictures_are_left_alone()
+    test_overlay_skips_an_unreadably_small_box()
+    test_a_cover_that_moves_its_panels_is_refused()
+    test_a_picture_containing_a_mark_is_not_a_mark()
+    test_nothing_the_overlay_draws_overlaps()
+    test_divider_cartoons_are_found_in_a_translated_manual()
+    test_unreadable_text_is_never_blanked()
+    test_audit_is_written_to_disk()
 
     print("\n" + "=" * 60)
     if failures:

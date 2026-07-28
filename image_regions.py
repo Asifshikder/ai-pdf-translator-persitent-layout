@@ -42,13 +42,22 @@ BACKDROP_MAX_ITEMS = 2  # a rectangle is one "re"; anything richer is real artwo
 # the region's bbox to the top of the paper.
 BACKDROP_MIN_SPAN = 0.80  # fraction of a page dimension
 
-# A vector cluster is only localized on a page that is essentially a picture: a divider
-# or a cover. The same clustering on a body page also groups the line art of tables and
-# diagrams — the "Exercise can:" grid, a flow diagram — and the image model regenerates
-# those as pictures, i.e. destroys them. Measured on the 176-page Post-MI manual: at this
-# limit the only regions found are the seven placements of the cover cartoon; without it,
-# 34 candidates including two halves of a checkbox table.
-MAX_TEXT_LINES_FOR_VECTOR_PAGE = 12
+# How much live text may sit INSIDE a cluster before it stops being a picture.
+#
+# What has to be kept out is the line art of tables and diagrams — the "Exercise can:" grid,
+# a flow diagram, a checkbox list — because the image model regenerates those as pictures,
+# i.e. destroys them. This used to be asked of the whole page ("is this page essentially a
+# picture?", limit 12 lines), which is a proxy, and the proxy broke the moment the manual was
+# translated: Bangla wraps into more lines than the English it was measured on, so a divider
+# page went from 12 lines to 16 and its cartoon became invisible. On the Revascularisation
+# manual that silently cost every divider illustration in the book — the audit for a 91-page
+# run recorded zero vector regions.
+#
+# The cluster's own text is the real signal, and it separates the two cases cleanly. Measured
+# on that manual: the divider cartoons carry 3-6 lines inside their bbox, while table and
+# diagram clusters carry 38, 49, 81, 90, 97, 239 and 286. Anything in between is a judgement
+# the classifier is better placed to make than a threshold.
+MAX_TEXT_LINES_IN_REGION = 12
 
 # Drawing fragments this close to the page edge are printer's furniture — crop marks,
 # registration targets, colour bars. They cluster with real art and drag its bbox out to
@@ -121,6 +130,28 @@ def _text_line_count(page: fitz.Page) -> int:
     except Exception:
         logger.debug("Could not count text lines", exc_info=True)
         return 0
+
+
+def _text_lines_in(page: fitz.Page, rect: fitz.Rect) -> int:
+    """Number of the page's text lines that lie inside `rect`.
+
+    Majority containment, not intersection: a caption printed hard against an illustration
+    clips its bbox by a hair, and counting that as text *in* the picture would veto exactly
+    the pictures this is meant to admit. See MAX_TEXT_LINES_IN_REGION.
+    """
+    count = 0
+    try:
+        for block in page.get_text("dict")["blocks"]:
+            if block["type"] != 0:
+                continue
+            for line in block["lines"]:
+                line_rect = fitz.Rect(line["bbox"])
+                area = line_rect.get_area()
+                if area > 0 and (line_rect & rect).get_area() > 0.5 * area:
+                    count += 1
+    except Exception:
+        logger.debug("Could not count text lines in a region", exc_info=True)
+    return count
 
 
 class TextFreePages:
@@ -264,17 +295,6 @@ def _illustration_clusters(
     if not drawings:
         return []
 
-    # Only a page that is essentially a picture is eligible: see
-    # MAX_TEXT_LINES_FOR_VECTOR_PAGE for why a body page must never be.
-    line_count = _text_line_count(page)
-    if line_count > MAX_TEXT_LINES_FOR_VECTOR_PAGE:
-        logger.debug(
-            "Page %d: %d text lines — too much text for vector illustration localization",
-            page_num,
-            line_count,
-        )
-        return []
-
     # Crop marks and registration targets match the checkbox test exactly, and one sitting
     # in the paper margin would veto any region that reached up to the trim line.
     protected_rects = [pr for pr in protected_rects if not _in_trim_margin(pr, page)]
@@ -363,6 +383,18 @@ def _illustration_clusters(
         if bbox.width < MIN_CLUSTER_DIM or bbox.height < MIN_CLUSTER_DIM:
             continue
         if bbox.get_area() / page.rect.get_area() > MAX_CLUSTER_COVERAGE:
+            continue
+
+        # The line art of a table, a checkbox list or a flow diagram, which the image model
+        # would regenerate as a picture and so destroy. Such a cluster has the page's words
+        # *inside* it; an illustration does not. See MAX_TEXT_LINES_IN_REGION.
+        region_lines = _text_lines_in(page, bbox)
+        if region_lines > MAX_TEXT_LINES_IN_REGION:
+            logger.debug(
+                "Page %d: cluster at %s rejected — %d text lines sit inside it, so it is a "
+                "table or diagram rather than a picture",
+                page_num, bbox, region_lines,
+            )
             continue
 
         # Veto: reject if a checkbox, rule or panel that is *not part of this drawing*

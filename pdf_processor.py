@@ -119,6 +119,38 @@ BACKTRACK_EM = 0.5
 COLUMN_GAP_EM = 0.9
 COLUMN_GAP_MIN = 12.0
 
+# A *justified* line defeats the column test above. Justification widens every
+# space in the line until it reaches both margins, and a line holding few long
+# words gets widened a lot: "One particular type of" is set across a 154pt
+# column with 13.3pt between the words. PyMuPDF reports each word as its own
+# line at that point, `_rows` puts them back on one row, and the column test
+# then reads three ordinary word spaces as three column breaks.
+#
+# What follows is the damage, not a cosmetic split: each word becomes its own
+# segment, is sent to the translator alone — "One", "particular", "type" carry
+# no sentence to translate — and is then planned as a standalone label, which
+# earns it `10 * size` of growth to the right, straight across the paragraph it
+# was cut out of. Four segments end up drawn on top of each other. This is what
+# put the overlapping Bangla on p.147 of the Post-MI manual.
+#
+# Three things together say "justified line" rather than "table row", measured
+# over 923 multi-piece rows in four manuals — they fuse all 41 justified splits
+# and leave every genuine table row (day-planner, food table, Likert header,
+# TOC, nutrition panel) split:
+#
+#   * The gaps are *uniform*. One line's spaces are all stretched by the same
+#     amount; column positions are set independently and rarely match.
+#   * The gaps are *small*. Stretch is bounded by how much slack one line has;
+#     2 ems covers every case seen (the widest was 20.5pt at 11pt) while the
+#     narrowest genuine column gap sat far above it.
+#   * The row is set to the full measure, and it is not the only row in its
+#     block that is. That is what justification means, and it is what a table
+#     row cannot fake: a table's rows end wherever their last cell ends, so
+#     only the widest of them reaches the right margin.
+JUSTIFY_STRETCH_EM = 2.0
+JUSTIFY_UNIFORM = 1.3
+JUSTIFY_FLUSH = 1.5
+
 # Minimum gap between TOC entry text and its trailing page number.
 NUMBER_GAP = 12.0
 
@@ -191,6 +223,13 @@ BUBBLE_EDGE_SAMPLES = 20
 # Reclaiming the gap is what raised the Bangla from 9.0pt to 9.6pt (see
 # BANGLA_SIZE): at 0.80 it takes the segments that must shrink from 59 to 15.
 BELOW_GAP = 0.3
+
+# Sweeps of `_uncross`. Retracting one box can only ever free space for the
+# rest, so the pass converges, and it stops early as soon as a sweep changes
+# nothing. Across all 407 pages of the four manuals one sweep always settled
+# the page (67 pages needed it at all); the spare passes are for the page where
+# retracting one box first has to reveal the next pair.
+UNCROSS_PASSES = 3
 
 # Tried in order until the Bangla actually renders. insert_htmlbox draws nothing
 # at all when it cannot meet its floor, so a floor it can always meet must come
@@ -630,7 +669,65 @@ def _is_bullet(span: dict) -> bool:
     )
 
 
-def _parse_row(row: dict) -> tuple[list[dict], list[dict], dict | None]:
+def _piece(spans: list[dict], bullet: bool) -> dict:
+    """One column piece: its spans, its bounding box and its text."""
+    rect = fitz.Rect(spans[0]["bbox"])
+    for span in spans[1:]:
+        rect |= fitz.Rect(span["bbox"])
+    return {
+        "spans": spans,
+        "bullet": bullet,
+        "rect": rect,
+        "text": re.sub(r"\s+", " ", "".join(s["text"] for s in spans)).strip(),
+    }
+
+
+def _full_measure(rect: fitz.Rect, block_rect: fitz.Rect) -> bool:
+    """True if a row is set to the full measure — flush with its block's right edge.
+
+    Only the right margin is asked about. That is the one justification actually
+    controls; the left is free to move under a bullet or a hanging indent. The
+    bulleted item on p.78 of the Revascularisation manual sets its first line
+    from the bullet and indents the continuations past it, so no two of its rows
+    share a left edge and the paragraph did not read as justified at all — the
+    one case in four manuals that this pass still left broken. Dropping the
+    left-margin test fuses it and changes no other row of the 923 measured.
+    """
+    return block_rect.x1 - rect.x1 <= JUSTIFY_FLUSH
+
+
+def _is_justified(
+    row: dict, pieces: list[dict], block_rect: fitz.Rect, full_lines: int
+) -> bool:
+    """True if a row's pieces are the words of one justified line, not columns.
+
+    See JUSTIFY_STRETCH_EM for what each test is doing and what it was measured
+    against. All of them have to agree: any one of them alone also fires on a
+    genuine table row somewhere in the manuals.
+    """
+    if len(pieces) < 2 or full_lines < 2:
+        return False
+    if not _full_measure(row["rect"], block_rect):
+        return False
+    gaps = [b["rect"].x0 - a["rect"].x1 for a, b in zip(pieces, pieces[1:])]
+    if min(gaps) <= 0:
+        return False  # pieces that touch or overlap were never stretched apart
+    size = max(s["size"] for piece in pieces for s in piece["spans"])
+    if max(gaps) > JUSTIFY_STRETCH_EM * size:
+        return False
+    if max(gaps) > JUSTIFY_UNIFORM * min(gaps):
+        return False
+    styles = {
+        (round(s["size"], 1), s["font"], s["color"])
+        for piece in pieces
+        for s in piece["spans"]
+    }
+    return len(styles) == 1
+
+
+def _parse_row(
+    row: dict, block_rect: fitz.Rect, full_lines: int
+) -> tuple[list[dict], list[dict], dict | None]:
     """Split a row into (bullet spans, text column pieces, page-number span).
 
     Every column piece may carry its own leading bullet/checkbox glyph — grids
@@ -638,6 +735,10 @@ def _parse_row(row: dict) -> tuple[list[dict], list[dict], dict | None]:
     of each piece, not just from the first span of the row. Stripped glyphs are
     returned so they can be preserved on the page instead of re-rendered in the
     Bangla font (which has no box/tick glyphs and would show a wrong letter).
+
+    `block_rect` and `full_lines` (how many of the block's rows run its full
+    width) describe the block the row came from, and are only used to recognise
+    a justified line that the column test has cut into its separate words.
     """
     spans = [s for s in row["spans"] if s["text"].strip()]
 
@@ -669,12 +770,21 @@ def _parse_row(row: dict) -> tuple[list[dict], list[dict], dict | None]:
         if len(group) == 1 and _is_bullet(group[0]):
             bullets.append(group[0])  # the whole piece is just a bullet glyph
             continue
-        piece = {"spans": group, "bullet": had_bullet}
-        piece["rect"] = fitz.Rect(group[0]["bbox"])
-        for span in group[1:]:
-            piece["rect"] |= fitz.Rect(span["bbox"])
-        piece["text"] = re.sub(r"\s+", " ", "".join(s["text"] for s in group)).strip()
-        pieces.append(piece)
+        pieces.append(_piece(group, had_bullet))
+
+    if _is_justified(row, pieces, block_rect, full_lines):
+        # One line of one paragraph, not a row of cells: put its words back
+        # together so the translator sees a sentence and the planner sees a
+        # single box. Justification stretches every space alike, so the whole
+        # row fuses or none of it does. The words are rejoined with a space of
+        # our own rather than by concatenating the spans: the space that was
+        # stretched is not reliably part of either fragment's text.
+        fused = _piece(
+            [span for piece in pieces for span in piece["spans"]],
+            pieces[0]["bullet"],
+        )
+        fused["text"] = " ".join(piece["text"] for piece in pieces)
+        pieces = [fused]
     return bullets, pieces, number
 
 
@@ -728,8 +838,12 @@ def _extract_segments(
         block_x1 = block["bbox"][2]
         prev = None  # last segment in this block that may accept continuations
 
-        for row in _rows(block):
-            bullets, pieces, number = _parse_row(row)
+        rows = _rows(block)
+        block_rect = fitz.Rect(block["bbox"])
+        full_lines = sum(1 for r in rows if _full_measure(r["rect"], block_rect))
+
+        for row in rows:
+            bullets, pieces, number = _parse_row(row, block_rect, full_lines)
             for bullet in bullets:
                 kept.append(fitz.Rect(bullet["bbox"]))
             if number is not None:
@@ -913,13 +1027,18 @@ def _plan_insert_rects(
         limit_x1 = min(page.rect.x1 - 20, text_x1 + 2)
         if home is not None:
             limit_x1 = min(limit_x1, home.x1)
+        # Anything reaching further right than this box, on the same lines as it,
+        # stops it — including a neighbour that *starts* to the left of the box's
+        # own right edge. The old test only saw obstacles beginning at or beyond
+        # `base.x1`, which let a box grow clean through a paragraph it was
+        # interleaved with: the running head at the top of a Post-MI page grew
+        # 146pt right across the chapter title beside it. Clamping to `base.x1`
+        # rather than to the obstacle's edge keeps an already-overlapping
+        # neighbour from *shrinking* the box — growth is refused, never reversed,
+        # which is the same rule the pictures below have always followed.
         for o in others:
-            if o.x0 >= base.x1 - 1 and min(o.y1, base.y1) - max(o.y0, base.y0) > 1:
-                limit_x1 = min(limit_x1, o.x0 - 4)
-        # A picture standing anywhere to the right of the box's own edge stops it
-        # there. Clamping to `base.x1` rather than to the picture's edge is what
-        # keeps an already-overlapping figure from *shrinking* the box: growth is
-        # refused, never reversed.
+            if o.x1 > base.x1 and min(o.y1, base.y1) - max(o.y0, base.y0) > 1:
+                limit_x1 = min(limit_x1, max(base.x1, o.x0 - 4))
         for i in pictures:
             if i.x1 > base.x1 and min(i.y1, base.y1) - max(i.y0, base.y0) > 1:
                 limit_x1 = min(limit_x1, max(base.x1, i.x0 - 4))
@@ -931,9 +1050,12 @@ def _plan_insert_rects(
         limit_y1 = page.rect.y1 - 16
         if home is not None:
             limit_y1 = min(limit_y1, home.y1)
+        # Same rule downwards: anything reaching below this box, in the columns
+        # it occupies, stops it — a caption sitting inside a paragraph's own
+        # bounding box blocks growth just as a paragraph below it does.
         for o in others:
-            if o.y0 >= base.y1 - 1 and min(o.x1, new_x1) - max(o.x0, base.x0) > 1:
-                limit_y1 = min(limit_y1, o.y0 - BELOW_GAP)
+            if o.y1 > base.y1 and min(o.x1, new_x1) - max(o.x0, base.x0) > 1:
+                limit_y1 = min(limit_y1, max(base.y1, o.y0 - BELOW_GAP))
         for i in pictures:
             if i.y1 > base.y1 and min(i.x1, new_x1) - max(i.x0, base.x0) > 1:
                 limit_y1 = min(limit_y1, max(base.y1, i.y0 - BELOW_GAP))
@@ -951,6 +1073,71 @@ def _plan_insert_rects(
             clipped = _clip_to_ink(*bubble, base, seg["insert_rect"])
             if clipped is not None and clipped.get_area() >= 0.5 * base.get_area():
                 seg["insert_rect"] = clipped
+
+    _uncross(segments)
+
+
+def _uncross(segments: list[dict]) -> None:
+    """Take back any growth that ran one segment's box into another's.
+
+    Every box above is planned on its own, against where the *source* text sat.
+    That is enough to stop a box growing into an occupied space, but not enough
+    to stop two boxes meeting in an empty one: the chapter title on a Post-MI
+    page grows 280pt right while the running head beside it grows a line down,
+    and they cross in the white space between them. Neither could see it coming
+    — each was still clear of the other's source rect when it was planned.
+
+    So the pair is settled afterwards, and only ever by giving growth back.
+    Boxes grow right and down only, so a pair that the source kept apart was
+    crossed by whichever of them sat on the near side of the gap; it is pulled
+    back to the edge of that gap, never past its own source rect. A pair the
+    source *already* overlapped is left alone — nothing here caused it, and the
+    fix pipeline's `_deconflict` is where that case is answered.
+    """
+    for _ in range(UNCROSS_PASSES):
+        settled = True
+        for i, a in enumerate(segments):
+            for b in segments[i + 1 :]:
+                shared = a["insert_rect"] & b["insert_rect"]
+                if shared.is_empty or shared.width <= 0 or shared.height <= 0:
+                    continue
+
+                # Each option is (area given back, segment, axis, new edge).
+                options = []
+                left = None
+                if a["rect"].x1 <= b["rect"].x0:
+                    left, right = a, b
+                elif b["rect"].x1 <= a["rect"].x0:
+                    left, right = b, a
+                if left is not None:
+                    edge = max(left["rect"].x1, right["rect"].x0 - 4)
+                    if edge < left["insert_rect"].x1:
+                        cost = (left["insert_rect"].x1 - edge) * left["insert_rect"].height
+                        options.append((cost, left, "x", edge))
+
+                upper = None
+                if a["rect"].y1 <= b["rect"].y0:
+                    upper, lower = a, b
+                elif b["rect"].y1 <= a["rect"].y0:
+                    upper, lower = b, a
+                if upper is not None:
+                    edge = max(upper["rect"].y1, lower["rect"].y0 - BELOW_GAP)
+                    if edge < upper["insert_rect"].y1:
+                        cost = (upper["insert_rect"].y1 - edge) * upper["insert_rect"].width
+                        options.append((cost, upper, "y", edge))
+
+                if not options:
+                    continue
+                _, seg, axis, edge = min(options, key=lambda option: option[0])
+                box = seg["insert_rect"]
+                seg["insert_rect"] = (
+                    fitz.Rect(box.x0, box.y0, edge, box.y1)
+                    if axis == "x"
+                    else fitz.Rect(box.x0, box.y0, box.x1, edge)
+                )
+                settled = False
+        if settled:
+            return
 
 
 def _probe(

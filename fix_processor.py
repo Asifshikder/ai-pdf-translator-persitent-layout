@@ -231,7 +231,17 @@ def _collisions(entry: dict, archive: fitz.Archive) -> list[tuple[int, int]]:
     inks = {}
     for idx in {i for pair in candidates for i in pair}:
         seg = entry["segments"][idx]
-        _, _, ink = _probe(scratch, boxes[idx], seg["bn"], css_for(seg), archive, seg["sc"])
+        # No floor. Handing the recorded scale back as `scale_low` was meant to
+        # reproduce the page's own render, but it cannot: the manifest rounds
+        # the scale to three decimals and the box to two, so re-fitting the text
+        # lands a shade under the floor it was given — and PyMuPDF asserts on
+        # that rather than reporting a miss, which killed the whole Fix run on
+        # p.158 of the Revascularisation manual (`scale_low=0.945 scale=0.944…`).
+        # Nothing is lost by dropping it: insert_htmlbox returns the largest
+        # scale that fits whatever floor it is under, so the ink measured here
+        # is the same ink, and the segments that genuinely failed to render were
+        # already excluded above by `_is_dropped`.
+        _, _, ink = _probe(scratch, boxes[idx], seg["bn"], css_for(seg), archive, 0)
         if ink is not None:
             inks[idx] = ink
     scratch.close()
