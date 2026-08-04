@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a PDF with AI</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f4f5f7; --card:#fff; --line:#e0e0e0; --accent:#2f6fed; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181d; --card:#1f232b; --line:#3a3f48; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
+    background: var(--bg); color: #1a1a1a;
+  }
+  @media (prefers-color-scheme: dark) { body { color: #e8e8e8; } }
+
+  header {
+    display: flex; align-items: center; gap: 1rem; padding: .9rem 1.5rem;
+    background: var(--card); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 1.1rem; margin: 0; }
+  header .sub { opacity: .65; font-size: .85rem; margin: 0; }
+  header .spacer { flex: 1; }
+  a.back { color: var(--accent); text-decoration: none; font-size: .9rem; }
+  a.back:hover { text-decoration: underline; }
+
+  .main { display: flex; justify-content: center; padding: 1.5rem; }
+  .card {
+    background: var(--card); border-radius: 12px; padding: 2rem;
+    width: 100%; max-width: 760px; box-shadow: 0 4px 24px rgba(0,0,0,.08);
+  }
+
+  #drop {
+    border: 2px dashed #bbb; border-radius: 10px; padding: 2.5rem 2rem; text-align: center;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: .5rem; transition: border-color .15s, background .15s;
+  }
+  @media (prefers-color-scheme: dark) { #drop { border-color: #444; } }
+  #drop.over { border-color: var(--accent); background: rgba(47,111,237,.06); }
+  #drop .label { opacity: .8; }
+  #docName { font-weight: 600; word-break: break-all; }
+
+  .loaded {
+    display: flex; align-items: center; gap: .6rem; padding: .7rem .9rem;
+    border: 1px solid var(--line); border-radius: 8px; font-size: .92rem;
+  }
+  .loaded .spacer { flex: 1; }
+
+  label.field { display: block; font-size: .8rem; font-weight: 700; opacity: .7;
+    margin: 1.5rem 0 .4rem; text-transform: uppercase; letter-spacing: .05em; }
+
+  textarea {
+    width: 100%; min-height: 120px; padding: .8rem; border-radius: 8px; resize: vertical;
+    border: 1px solid var(--line); background: transparent; color: inherit;
+    font: inherit; font-size: .95rem; line-height: 1.5;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  button {
+    padding: .7rem 1rem; font-size: .95rem; border: 0; border-radius: 8px;
+    background: var(--accent); color: #fff; cursor: pointer; font-weight: 600;
+    font-family: inherit;
+  }
+  button:hover:not(:disabled) { opacity: .9; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: transparent; color: inherit; border: 1px solid var(--line);
+    font-weight: 500; }
+  button.small { padding: .4rem .7rem; font-size: .85rem; }
+  #fixBtn { width: 100%; margin-top: 1.25rem; padding: .9rem; font-size: 1rem; }
+  .row { display: flex; gap: .5rem; margin-top: .7rem; flex-wrap: wrap; align-items: center; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .6rem; }
+  .chip { display: flex; align-items: center; gap: .45rem; font-size: .8rem;
+    background: rgba(47,111,237,.1); border-radius: 999px; padding: .25rem .7rem .25rem .25rem; }
+  .chip img { width: 24px; height: 24px; object-fit: cover; border-radius: 50%; }
+  .chip .x { cursor: pointer; opacity: .55; font-weight: 700; }
+  .chip .x:hover { opacity: 1; }
+
+  #status { margin-top: 1rem; font-size: .95rem; min-height: 1.2em; font-weight: 600; }
+  #status.error { color: #d33; font-weight: 500; }
+
+  #report { margin-top: 1rem; font-size: .9rem; }
+  #report .analysis { opacity: .78; line-height: 1.55; margin: 0 0 .8rem; }
+  .pageblock { border: 1px solid var(--line); border-radius: 10px; padding: .9rem;
+    margin-bottom: .8rem; }
+  .pageblock h3 { margin: 0 0 .5rem; font-size: .9rem; }
+  .pageblock ul { list-style: none; margin: 0; padding: 0; }
+  .pageblock li { padding: .4rem .55rem; border-radius: 6px; margin-bottom: .3rem;
+    background: rgba(127,127,127,.09); line-height: 1.45; font-size: .86rem; }
+  .pageblock li .tag { font-weight: 700; font-size: .7rem; text-transform: uppercase;
+    letter-spacing: .04em; margin-right: .4rem; }
+  li.applied .tag { color: #1a8c4a; }
+  li.failed  .tag { color: #d33; }
+  li.skipped .tag { opacity: .55; }
+  .pageblock li .detail { opacity: .68; }
+  .pageblock img { display: block; margin-top: .7rem; max-width: 100%; height: auto;
+    border: 1px solid var(--line); border-radius: 6px; }
+
+  .hint { font-size: .85rem; opacity: .68; line-height: 1.55; }
+  p.hint { margin: .5rem 0 0; }
+
+  .spinner { display: inline-block; width: 14px; height: 14px; vertical-align: -2px;
+    border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+    animation: spin .7s linear infinite; margin-right: .55rem; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Fix a PDF with AI</h1>
+    <p class="sub">Upload it, say what is wrong, attach any images it needs.</p>
+  </div>
+  <div class="spacer"></div>
+  <a class="back" href="/">← All tools</a>
+</header>
+
+<div class="main">
+  <div class="card">
+    <div id="drop">
+      <span class="label">Drop a PDF here or click to choose a file</span>
+      <span class="hint">It stays on this machine — held in the server's memory until you
+        download the result.</span>
+      <div id="docName"></div>
+    </div>
+    <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
+
+    <div id="loaded" class="loaded hidden">
+      <span id="loadedName"></span>
+      <span class="spacer"></span>
+      <button class="ghost small" id="resetBtn">Change file</button>
+    </div>
+
+    <div id="work" class="hidden">
+      <label class="field" for="instruction">What should be fixed?</label>
+      <textarea id="instruction" placeholder="e.g. On the contents page the subtitle still says &quot;Not just a book&quot; — it should be &quot;More than a book&quot;.
+Or: Replace the cartoon of the woman at the computer with the attached photo.
+Or: The heading on the exercise page is still in English — translate it to Bangla.
+Or: Remove the empty grey box under the table on page 6."></textarea>
+      <p class="hint">You do not have to say which page — say what you can see and the AI
+        finds it. Naming a page works too.</p>
+
+      <label class="field">Images to use (optional)</label>
+      <button class="ghost small" id="attachBtn">Attach images</button>
+      <input type="file" id="imageInput" accept="image/*" multiple hidden>
+      <div class="chips" id="chips"></div>
+
+      <button id="fixBtn">Fix it</button>
+      <div class="row">
+        <button class="ghost small" id="undoBtn" disabled>Undo last fix</button>
+        <button class="ghost small" id="downloadBtn">Download PDF</button>
+      </div>
+
+      <div id="status"></div>
+      <div id="report"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+const drop = el('drop'), fileInput = el('fileInput'), imageInput = el('imageInput');
+const statusEl = el('status'), reportEl = el('report'), chipsEl = el('chips');
+
+let sid = null, busy = false, undoDepth = 0;
+let pending = [];    // images chosen but not yet sent
+let sent = [];       // names of images the server already holds
+
+/* ---------- upload ---------- */
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => {
+  e.preventDefault(); drop.classList.remove('over');
+  upload(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => upload(fileInput.files[0]));
+
+async function upload(f) {
+  if (!f) return;
+  if (!f.name.toLowerCase().endsWith('.pdf')) {
+    el('docName').textContent = 'Please choose a PDF file.';
+    return;
+  }
+  el('docName').textContent = 'Opening ' + f.name + '…';
+  try {
+    const form = new FormData();
+    form.append('file', f);
+    const data = await post('/pagefix/upload', form);
+    sid = data.session;
+    undoDepth = 0; pending = []; sent = [];
+    renderChips();
+    el('loadedName').textContent = `${data.filename} — ${data.pages} page${data.pages === 1 ? '' : 's'}`;
+    drop.classList.add('hidden');
+    el('loaded').classList.remove('hidden');
+    el('work').classList.remove('hidden');
+    el('docName').textContent = '';
+    setStatus('', false);
+    reportEl.innerHTML = '';
+  } catch (err) {
+    el('docName').textContent = err.message;
+  }
+}
+
+async function post(url, body) {
+  const res = await fetch(url, { method: 'POST', body });
+  if (!res.ok) {
+    let msg = 'Request failed.';
+    try { msg = (await res.json()).detail || msg; } catch {}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+el('resetBtn').addEventListener('click', () => {
+  sid = null; undoDepth = 0; pending = []; sent = [];
+  fileInput.value = '';
+  el('instruction').value = '';
+  el('docName').textContent = '';
+  reportEl.innerHTML = '';
+  setStatus('', false);
+  drop.classList.remove('hidden');
+  el('loaded').classList.add('hidden');
+  el('work').classList.add('hidden');
+});
+
+/* ---------- attachments ---------- */
+
+el('attachBtn').addEventListener('click', () => imageInput.click());
+imageInput.addEventListener('change', () => {
+  for (const f of imageInput.files) if (f.type.startsWith('image/')) pending.push(f);
+  imageInput.value = '';
+  renderChips();
+});
+
+function renderChips() {
+  chipsEl.innerHTML = '';
+  if (!sent.length && !pending.length) {
+    const hint = document.createElement('span');
+    hint.className = 'hint';
+    hint.textContent = 'None — attach one if the fix needs an image put into the PDF.';
+    chipsEl.appendChild(hint);
+    return;
+  }
+  sent.forEach(name => chipsEl.appendChild(makeChip(name, null, null)));
+  pending.forEach((f, i) => chipsEl.appendChild(makeChip(f.name, f, i)));
+}
+
+function makeChip(name, file, index) {
+  const chip = document.createElement('div');
+  chip.className = 'chip';
+  if (file) {
+    const img = document.createElement('img');
+    img.src = URL.createObjectURL(file);
+    chip.appendChild(img);
+  }
+  const label = document.createElement('span');
+  label.textContent = name;
+  chip.appendChild(label);
+  if (file) {
+    const x = document.createElement('span');
+    x.className = 'x';
+    x.textContent = '×';
+    x.title = 'Remove';
+    x.addEventListener('click', () => { pending.splice(index, 1); renderChips(); });
+    chip.appendChild(x);
+  }
+  return chip;
+}
+
+/* ---------- the fix ---------- */
+
+el('fixBtn').addEventListener('click', async () => {
+  const instruction = el('instruction').value.trim();
+  if (!sid || busy) return;
+  if (!instruction) { setStatus('Describe what needs fixing.', true); return; }
+
+  setBusy(true, 'Looking through the document and planning the fix…');
+  reportEl.innerHTML = '';
+  try {
+    const form = new FormData();
+    form.append('instruction', instruction);
+    for (const f of pending) form.append('images', f);
+
+    const data = await post(`/pagefix/${sid}/fix`, form);
+    sent = sent.concat(pending.map(f => f.name));
+    pending = [];
+    renderChips();
+    if (data.changed) {
+      undoDepth++;
+      el('undoBtn').disabled = false;
+    }
+    setStatus(data.summary, false);
+    renderReport(data);
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
+function renderReport(data) {
+  reportEl.innerHTML = '';
+  if (data.analysis) {
+    const p = document.createElement('p');
+    p.className = 'analysis';
+    p.textContent = data.analysis;
+    reportEl.appendChild(p);
+  }
+  (data.pages || []).forEach(pageReport => {
+    const block = document.createElement('div');
+    block.className = 'pageblock';
+
+    const title = document.createElement('h3');
+    title.textContent = `Page ${pageReport.page}` + (pageReport.changed ? '' : ' — unchanged');
+    block.appendChild(title);
+
+    if (pageReport.analysis) {
+      const note = document.createElement('p');
+      note.className = 'analysis';
+      note.textContent = pageReport.analysis;
+      block.appendChild(note);
+    }
+
+    if (pageReport.operations && pageReport.operations.length) {
+      const list = document.createElement('ul');
+      pageReport.operations.forEach(op => {
+        const li = document.createElement('li');
+        li.className = op.status || 'skipped';
+        const tag = document.createElement('span');
+        tag.className = 'tag';
+        tag.textContent = op.status || 'skipped';
+        const text = document.createElement('span');
+        text.textContent = `${op.action} — ${op.note || ''}`;
+        const detail = document.createElement('span');
+        detail.className = 'detail';
+        detail.textContent = op.detail ? ` (${op.detail})` : '';
+        li.append(tag, text, detail);
+        list.appendChild(li);
+      });
+      block.appendChild(list);
+    }
+
+    if (pageReport.changed) {
+      const img = document.createElement('img');
+      // Cache-busted: the same URL returns different pixels after every fix.
+      img.src = `/pagefix/${sid}/page/${pageReport.page}?v=${Date.now()}`;
+      img.alt = `page ${pageReport.page} after the fix`;
+      block.appendChild(img);
+    }
+    reportEl.appendChild(block);
+  });
+}
+
+el('undoBtn').addEventListener('click', async () => {
+  if (!sid || busy) return;
+  setBusy(true, 'Undoing…');
+  try {
+    const data = await post(`/pagefix/${sid}/undo`, new FormData());
+    if (data.undone) {
+      undoDepth = Math.max(0, undoDepth - 1);
+      setStatus('Reverted the last fix.', false);
+      reportEl.innerHTML = '';
+    } else {
+      setStatus('There is nothing to undo.', false);
+    }
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
+el('downloadBtn').addEventListener('click', () => {
+  if (sid) window.location = `/pagefix/${sid}/download`;
+});
+
+function setStatus(text, isError) {
+  statusEl.textContent = text;
+  statusEl.className = isError ? 'error' : '';
+}
+
+function setBusy(state, message) {
+  busy = state;
+  el('fixBtn').disabled = state;
+  el('undoBtn').disabled = state || undoDepth === 0;
+  if (state) {
+    statusEl.className = '';
+    statusEl.innerHTML = '<span class="spinner"></span>' + message;
+  }
+}
+
+renderChips();
+</script>
+</body>
+</html>

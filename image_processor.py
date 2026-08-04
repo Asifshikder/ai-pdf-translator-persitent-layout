@@ -174,6 +174,16 @@ CONTEXT_MIN_WORDS = 8
 # the page's sentence it comes back with detail invented to satisfy it.
 SIMPLE_MODE_MAX_PIXELS = 120_000
 
+# Whether a picture carrying no baked text is redrawn as a Bangladeshi scene ("reimagine")
+# instead of retouched in place ("context"). On, because the retouch is what produced the
+# complaint this exists to answer: the prompt's own "nothing moves and nothing resizes" — a
+# rule the fixed text overlay needs — is read by the model as permission to change the faces
+# and the clothes and leave the Western room, street and props standing.
+#
+# Turn it off to go back to the pinned-frame edit everywhere. What that costs is visible in
+# the audit: `regeneration_mode` says which prompt each picture got.
+REIMAGINE_TEXTLESS_PICTURES = True
+
 # ---------------------------------------------------------------------------------------
 # Cover
 # ---------------------------------------------------------------------------------------
@@ -1321,7 +1331,16 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
             png_bytes, w, h = raster_result
             region_sources[content_key] = png_bytes
             futures[
-                executor.submit(_decide_from_png, png_bytes, w, h, f"region:{content_key}", region.page_num, region.page_context)
+                executor.submit(
+                    _decide_from_png,
+                    png_bytes,
+                    w,
+                    h,
+                    f"region:{content_key}",
+                    region.page_num,
+                    region.page_context,
+                    caller_veto=None if region.redraw_safe else "outlined_text_panel",
+                )
             ] = ("region", content_key)
 
         # Schedule the cover as a single whole-page job.
@@ -2337,18 +2356,52 @@ def _text_only_result(
     return cleaned, status, record
 
 
-def _regeneration_mode(page_context: str, width: int, height: int) -> str:
-    """Whether this picture is redrawn with the page's words ("context") or without ("simple").
+def _regeneration_mode(
+    page_context: str,
+    width: int,
+    height: int,
+    *,
+    has_baked_text: bool = True,
+    information_role: str = "referential",
+    contains_logo: bool = True,
+) -> str:
+    """Which of image_localizer.LOCALIZE_MODES this picture is regenerated with.
 
-    See image_localizer.LOCALIZE_MODES. Both conditions are about the same failure from
-    opposite ends: the model treats whatever it is handed as a brief, so three stray words
-    of context, or a paragraph of art direction aimed at a 300x300 icon, produce a picture
-    with detail invented to satisfy an instruction that was never about it.
+    "context" vs "simple" is about the same failure from opposite ends: the model treats
+    whatever it is handed as a brief, so three stray words of context, or a paragraph of art
+    direction aimed at a 300x300 icon, produce a picture with detail invented to satisfy an
+    instruction that was never about it.
+
+    "reimagine" is the answer to a different failure — the picture that came back with
+    Bangladeshi faces in the same Western room. Both edit prompts pin every element to its
+    original position, because text OCR'd off the original is painted back into those exact
+    boxes afterwards; told to move nothing, the model satisfies "make it Bangladeshi" with
+    the cheapest change it can make, which is the skin, the hair and the clothes. Freeing the
+    frame is what fixes that, and it is only safe when nothing has to line up afterwards:
+
+      - `has_baked_text` — the decisive one. A recomposed picture and an overlay placed from
+        the original's coordinates cannot both be right; the boxes already drift measurably
+        under a *constrained* edit. No text in the picture, nothing to drift.
+      - `information_role` — a referential picture is a datum the page states in words, so it
+        is not ours to recompose. This normally cannot reach here (VETO_REFERENTIAL_
+        REGENERATION already returned), and is re-checked rather than assumed because the
+        flag is a flag.
+      - `contains_logo` — a mark inside the picture is protected by position, and a redraw
+        that moves the frame moves it.
+      - size and context, as for "context" mode: a redraw needs a real brief and a picture
+        big enough to hold a scene, or the freedom is spent inventing detail.
     """
     if width * height <= SIMPLE_MODE_MAX_PIXELS:
         return "simple"
     if len(page_context.split()) < CONTEXT_MIN_WORDS:
         return "simple"
+    if (
+        REIMAGINE_TEXTLESS_PICTURES
+        and not has_baked_text
+        and not contains_logo
+        and information_role == "decorative"
+    ):
+        return "reimagine"
     return "context"
 
 
@@ -2430,6 +2483,7 @@ def _decide_from_png(
     page_num: int,
     page_context: str = "",
     in_series: bool = False,
+    caller_veto: str | None = None,
 ) -> tuple[bytes | None, str, dict]:
     """Classify, OCR, and edit a PNG image. Core decision logic used by both xref-extracted
     and rasterized-region paths.
@@ -2441,6 +2495,10 @@ def _decide_from_png(
         page_num: page number for logging
         page_context: nearby text context for the edit model
         in_series: this image is one tile of a repeated set (see _series_xrefs)
+        caller_veto: a reason the caller already knows this must not be redrawn, joining
+            the VETO_* guards below. The vector path uses it: whether a cluster is a
+            picture or a panel of words is legible in its drawings and not in its pixels,
+            so it is decided where the drawings are — see image_regions.redraw_safe.
 
     Returns: (edited_bytes, status, audit_record)
     """
@@ -2513,19 +2571,22 @@ def _decide_from_png(
             empty_status="classify_failed",
         )
 
-    # Three independent reasons a picture must not be redrawn, checked before the
-    # cultural question is even asked. Any one of them is enough, and none of them
-    # depends on the edit model behaving: a redrawn drink in a units chart is a
-    # factual error in a clinical document, so the guards are deliberately
-    # over-lapping rather than minimal. Such an image still gets its baked English
-    # translated — it is the pixels that are protected, not the language.
+    # Independent reasons a picture must not be redrawn, checked before the cultural
+    # question is even asked. Any one of them is enough, and none of them depends on
+    # the edit model behaving: a redrawn drink in a units chart is a factual error in
+    # a clinical document, so the guards are deliberately over-lapping rather than
+    # minimal. Such an image still gets its baked English translated — it is the
+    # pixels that are protected, not the language.
     #
-    # Which of these are on is set by the VETO_* flags: see their definition.
-    veto = None
+    # Which of the three read here are on is set by the VETO_* flags: see their
+    # definition. `caller_veto` is the fourth and is not a flag — the caller has
+    # already established the fact, so there is nothing left to decide.
     # Defaulted here as well as in classify_image: a decision that never named a role is not
     # a decision to redraw, and this branch must not be the one place that reads a missing
     # field as permission.
-    if VETO_REFERENTIAL_REGENERATION and (
+    if caller_veto:
+        veto = caller_veto
+    elif VETO_REFERENTIAL_REGENERATION and (
         decision.get("information_role", "referential") != "decorative"
     ):
         veto = "referential"
@@ -2533,6 +2594,8 @@ def _decide_from_png(
         veto = "series_member"
     elif VETO_SMALL_REGENERATION and width * height < REGEN_MIN_PIXELS:
         veto = "too_small_to_regenerate"
+    else:
+        veto = None
     if veto:
         record["regeneration_vetoed"] = veto
 
@@ -2603,7 +2666,18 @@ def _decide_from_png(
             page_context=page_context,
         )
 
-    mode = _regeneration_mode(page_context, width, height)
+    # `blocks` is the OCR read above, and it is what decides whether the frame can be freed:
+    # every word in this list is painted back afterwards at a box measured on the ORIGINAL, so
+    # a picture that has any is redrawn in place. An empty list here is a real "no text in the
+    # picture" — an OCR that merely failed returned at the ocr_failed branch above.
+    mode = _regeneration_mode(
+        page_context,
+        width,
+        height,
+        has_baked_text=bool(blocks),
+        information_role=decision.get("information_role", "referential"),
+        contains_logo=bool(decision.get("is_logo")),
+    )
     record["regeneration_mode"] = mode
     start = time.time()
     new_image = localize_image(

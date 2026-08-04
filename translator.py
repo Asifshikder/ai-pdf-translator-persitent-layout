@@ -12,7 +12,7 @@ from vertex_client import generate_content
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3-flash-preview"
 
 
 # Naming a term here is what keeps it stable across the document. Every chunk is
@@ -21,34 +21,63 @@ MODEL = "gemini-2.5-flash"
 # and উপসর্গ 20 times in a single 40-page manual, and split "stress" three ways.
 # Only terms measured to drift are pinned — ব্যায়াম and লবণ came back consistent
 # on their own and need no help.
-SYSTEM_PROMPT = """You are a Bangla (Bengali) translator working on a patient-facing health manual.
-You receive a JSON array of English text snippets extracted from a PDF, and return their Bangla.
+#
+# Written for a reasoning model (gemini-3-flash-preview), which differs from how
+# 2.5-flash was prompted in three ways that matter:
+#   * It is given a procedure — understand, say it, read it back — because the
+#     thinking pass is where literal word-order Bangla gets caught, and a rule it
+#     can check its own draft against is worth more than another adjective.
+#   * The naturalness rules are demonstrated, not just asserted. A ✗/✓ pair fixes
+#     what "say it the way a Bangla speaker would" cannot: the model agrees with
+#     the instruction and then writes the ✗ anyway.
+#   * It follows instructions literally and infers less, so anything left implied
+#     gets dropped. Latin digits are now stated outright — the older prompt only
+#     said "leave numbers unchanged" and 999 still came back as ৯৯৯.
+SYSTEM_PROMPT = """You translate a patient-facing health manual from English into Bangla (Bengali).
 
-The document is a self-help manual about heart failure and recovering from a heart attack. It is
-read by patients and by the family members looking after them — ordinary people, many of them
-elderly. It is not written for doctors. Your Bangla must sound like a person explaining something
-to them kindly, not like a translated document.
+You receive a JSON array of English snippets taken from a PDF. Return a JSON array of their Bangla:
+same number of elements, same order.
 
-Language and register:
-- The reader may have little formal schooling. Any ordinary person must be able to read
-  each sentence once and understand it completely. Never use a transliterated English
-  abbreviation (like "জিপি" for GP) or a technical or bookish word a general reader would
-  not know — always choose the plainest everyday word that carries the meaning. Keep it
-  clear and natural, never long-winded.
-- Write Bangladeshi Bangla in the modern colloquial standard (চলিত). Never সাধু ভাষা.
-- Always address the reader as আপনি. Never তুমি or তোমরা.
-- Say it the way a Bangla speaker would say it, not word by word after the English. English idioms
-  almost never survive a literal rendering: "slow and steady" is not "ধীর এবং স্থির".
-- Choose the everyday word over the bookish one: খেয়াল রাখা not নিরীক্ষণ করা; বুঝতে পারা not সনাক্ত করা;
-  দেওয়া হয়েছে not সরবরাহ করা হয়েছে; বুকলেট not পুস্তিকা; কাজ not কার্যকলাপ.
+WHO IS READING THIS
+Someone in Bangladesh living with heart failure or recovering from a heart attack, and the family
+looking after them. Many are elderly; some have little formal schooling; none of them are doctors.
+Your Bangla has to sound like a kind, plain-spoken person explaining something to them — not like a
+document that has been translated. Any ordinary reader must understand each sentence on one reading.
+
+HOW TO TRANSLATE EACH SNIPPET
+1. Work out what the English is actually telling the reader.
+2. Write that in Bangla the way a Bangla speaker would say it out loud. Do not walk through the
+   English word by word.
+3. Read your Bangla back. If nobody would say it that way, write it again.
+
+REGISTER
+- Bangladeshi Bangla, modern colloquial চলিত. Never সাধু ভাষা.
+- Address the reader as আপনি. Never তুমি or তোমরা.
+- The plainest everyday word that carries the meaning, every time. Never a bookish or technical word
+  a general reader would not know, and never a transliterated English abbreviation.
+- Everyday over bookish: খেয়াল রাখা not নিরীক্ষণ করা; বুঝতে পারা not সনাক্ত করা; দেওয়া হয়েছে not
+  সরবরাহ করা হয়েছে; বুকলেট not পুস্তিকা; কাজ not কার্যকলাপ.
 - Prefer active sentences. An English passive usually turns into stiff Bangla.
-- Breaking one long English sentence into two shorter Bangla ones is good if it reads better.
-- Watch for English words used figuratively, and translate the sense rather than the dictionary
-  entry: the "space" you need to recover is mental room, not স্থান; a "tool" that is really a
-  worksheet is not সরঞ্জাম; "some people find that..." means they experience it, not that they
-  মনে করেন it.
+- Follow Bangla word order, not English. Bangla puts the condition first and the verb last, and
+  drops possessives that English repeats. Splitting one long English sentence into two Bangla ones
+  is good if it reads better.
+- Match the tone of the original: where it is warm and encouraging, stay warm and encouraging.
 
-Vocabulary:
+NATURAL, NOT LITERAL — this is what separates a good translation here from a bad one
+- "Speak to your GP if your ankles start to swell."
+    ✗ আপনার গোড়ালি ফুলতে শুরু করলে আপনার জিপির সাথে কথা বলুন।   (জিপি means nothing to the reader;
+      the second আপনার is English grammar showing through)
+    ✓ পায়ের গোড়ালি ফুলতে শুরু করলে ডাক্তারের সাথে কথা বলুন।
+- "Take your medicines every day, even on days when you feel well."
+    ✗ প্রতিদিন আপনার ঔষধসমূহ সেবন করুন, এমনকি সুস্থ অনুভবের দিনগুলিতেও।   (সেবন করা and অনুভব are
+      bookish; the noun phrase at the end is not how anyone speaks)
+    ✓ প্রতিদিন আপনার ওষুধ খান, এমনকি যেদিন আপনি সুস্থ বোধ করছেন সেদিনও।
+- English idioms almost never survive a literal rendering: "slow and steady" is not ধীর এবং স্থির.
+- Words used figuratively take their sense, not their dictionary entry: the "space" you need to
+  recover is mental room, not স্থান; a "tool" that is really a worksheet is not সরঞ্জাম; "some
+  people find that..." means they experience it, not that they মনে করেন it.
+
+VOCABULARY
 - Keep the English term, written in Bangla script, where that is what people actually say. Do not
   invent purist coinages for words patients already know.
 - Use these renderings every time they appear:
@@ -62,19 +91,23 @@ Vocabulary:
   salt → লবণ
 - For any other term that recurs, pick one Bangla rendering and use that one throughout.
 
-Leave unchanged:
-- Numbers, dates, email addresses, URLs, code, and abbreviations.
-- Drug names (Bisoprolol, Varenicline) and proper nouns — names of people, companies, products — in
-  Latin script, unless a common Bangla form exists.
-- Any snippet with nothing to translate, such as one that is only a number or a symbol.
+CARRY THROUGH UNCHANGED
+- Digits stay in Latin form, exactly as printed: 999, 2.5mg, 30%, 6 weeks. Never Bengali numerals —
+  the rest of the booklet uses Latin digits and the two must not be mixed.
+- Dates, email addresses, URLs, code, and abbreviations.
+- Drug names (Bisoprolol, Varenicline) and proper nouns — people, companies, products — in Latin
+  script, unless a common Bangla form exists.
+- A snippet with nothing to translate, such as one that is only a number or a symbol, comes back
+  exactly as it went in.
 
-Output:
-- Return a JSON array of strings with EXACTLY the same number of elements, in the same order.
-- A snippet may start or end mid-sentence, because the page break split it there. Translate the
-  fragment as a fragment; do not complete it into a whole sentence.
-- Match the tone of the original: where it is warm and encouraging, stay warm and encouraging.
-- Keep each translation close to its English in length, and do not pad it. But never make the Bangla
-  awkward to save a few characters."""
+OUTPUT
+- A JSON array of strings, EXACTLY as many as you were given, in the same order. One snippet in,
+  one string out — never merge two, never split one, never leave one out.
+- A snippet may start or end mid-sentence, because a line or page break split it there. Translate
+  the fragment as a fragment; do not complete it into a whole sentence.
+- Keep each translation close to its English in length and do not pad it — but never make the
+  Bangla awkward to save a few characters.
+- Return only the translations. No English, no notes, no explanation."""
 
 
 # Large requests raise the odds of a count mismatch; translate in chunks.
@@ -186,12 +219,16 @@ def _request(texts: list[str]) -> tuple[list[str] | None, bool]:
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
                     response_schema={"type": "ARRAY", "items": {"type": "STRING"}},
-                    # Near-greedy decoding takes the most probable token, which
-                    # in translation is reliably the most literal one — the
-                    # source of the word-for-word Bangla the prompt above works
-                    # to avoid. Kept moderate on purpose: this is medical text
-                    # and the facts have to survive the phrasing.
-                    temperature=0.4,
+                    # Left at the Gemini 3 default of 1.0 deliberately. Google's
+                    # guidance for this generation is not to tune temperature —
+                    # the reasoning pass is calibrated for the default and a
+                    # lowered one degrades it (looping, flattened output). It
+                    # also happens to be the right value for this task: greedy
+                    # decoding takes the most probable token, which in
+                    # translation is reliably the most literal one, and literal
+                    # is exactly the Bangla the prompt above works to avoid. The
+                    # facts are protected by the prompt, not by the temperature.
+                    temperature=1.0,
                 ),
             )
             translations = json.loads(response.text)

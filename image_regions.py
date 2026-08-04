@@ -64,6 +64,91 @@ MAX_TEXT_LINES_IN_REGION = 12
 # the paper's corner (seen on pages 19 and 37: a cover cluster starting at 21,21).
 TRIM_MARGIN = 28.0  # pt
 
+# What a checkbox-shaped protected rect has to look like before it may veto a region.
+#
+# `_vector_marks` reads size and aspect and nothing else, so anything 5-24pt and roughly
+# square is a "checkbox" to it — including a letter, when the letter is drawn as outlines
+# rather than set in a font. The "Exercise can:" heading above the exercise panel is drawn
+# that way, and seven of its letters (x, e, r, s, c, a, n) each measured ~7x7pt. Every one
+# of them vetoed the panel below, so the whole graphic — five English bullets on the left,
+# five on the right — went through translation untouched.
+#
+# A tick box is a rectangle: one "re" or four straight lines. Measured across the
+# Revascularisation manual, every mark-shaped drawing that is genuinely a box or a rule
+# has <=4 items and no curve segments, while every glyph or icon that merely looks like
+# one has 15-50 items and is built from curves. So a mark-shaped rect only counts as
+# furniture if the ink drawn at it is furniture-shaped too.
+MARK_MIN = 5.0  # pt: mirrors pdf_processor._vector_marks, which reports the rects
+MARK_MAX = 24.0  # pt
+MARK_ASPECT = 1.35
+FURNITURE_MAX_ITEMS = 6  # path items in a box or rule (real: 1-4; glyphs: 15-50)
+
+# Lettering drawn as outlines rather than set in a font, which is what makes a cluster a
+# panel of words rather than a picture of something.
+#
+# MAX_TEXT_LINES_IN_REGION asks the same question of the page's *live* text, and that is the
+# only text it can see. A layout that converts its headings and labels to paths is invisible
+# to it: the exercise panel reads as 2 live lines, which is cartoon territory, and the
+# classifier duly called it "decorative" and sent it to be redrawn — ten bullets of clinical
+# advice, regenerated as a picture. Counting the outlines puts it at 14 lines, next to 5 for
+# the divider cartoons whose only lettering is a three-word slogan on a t-shirt.
+#
+# A row needs several glyphs side by side before it is a line of text: single small paths
+# come in rows of one all over an illustration (a face's two eyes, a row of buttons).
+GLYPH_MAX_DIM = 24.0  # pt: a letter at this document's largest drawn size
+GLYPH_MIN_ITEMS = 8  # path items: fewer than this and the shape is too plain to be a letter
+GLYPH_ROW_TOLERANCE = 3.0  # pt: baselines this close are the same line
+GLYPH_ROW_MIN_LENGTH = 3  # glyphs abreast before a row counts as text
+
+
+def _is_mark_shaped(rect: fitz.Rect) -> bool:
+    """True if `rect` is the size and shape `_vector_marks` calls a checkbox."""
+    if not (MARK_MIN <= rect.width <= MARK_MAX and MARK_MIN <= rect.height <= MARK_MAX):
+        return False
+    return max(rect.width, rect.height) <= MARK_ASPECT * max(min(rect.width, rect.height), 0.1)
+
+
+def _is_furniture_ink(drawing: dict) -> bool:
+    """True if a drawing is a plain straight-edged outline — a box or a rule, not artwork.
+
+    See FURNITURE_MAX_ITEMS. Curves are disqualifying on their own: a tick box has
+    square corners, so anything rounded at this size is a glyph or an icon.
+    """
+    items = drawing.get("items", [])
+    if len(items) > FURNITURE_MAX_ITEMS:
+        return False
+    return not any(item[0] in ("c", "qu") for item in items)
+
+
+def _outlined_text_lines(drawings: list[dict]) -> int:
+    """Lines of lettering drawn as vector outlines among `drawings`. See GLYPH_MIN_ITEMS.
+
+    Glyphs are grouped by baseline, and a row counts only once several sit abreast of each
+    other, so an illustration's scattered small shapes do not read as prose.
+    """
+    glyphs = []
+    for drawing in drawings:
+        if drawing["type"] not in ("f", "fs"):
+            continue
+        rect = fitz.Rect(drawing["rect"])
+        if max(rect.width, rect.height) > GLYPH_MAX_DIM:
+            continue
+        if len(drawing.get("items", [])) < GLYPH_MIN_ITEMS:
+            continue
+        glyphs.append(rect)
+
+    rows: list[list[fitz.Rect]] = []
+    baselines: list[float] = []
+    for rect in sorted(glyphs, key=lambda r: r.y1):
+        for index, baseline in enumerate(baselines):
+            if abs(baseline - rect.y1) <= GLYPH_ROW_TOLERANCE:
+                rows[index].append(rect)
+                break
+        else:
+            baselines.append(rect.y1)
+            rows.append([rect])
+    return sum(1 for row in rows if len(row) >= GLYPH_ROW_MIN_LENGTH)
+
 
 @dataclass(frozen=True)
 class IllustrationRegion:
@@ -74,6 +159,9 @@ class IllustrationRegion:
     rect: fitz.Rect
     item_count: int  # total number of drawing items in the cluster
     page_context: str  # nearby text context for the edit model
+    # False when the cluster is a panel of words: its English still has to be translated,
+    # but the picture underneath must not be regenerated. See _outlined_text_lines.
+    redraw_safe: bool = True
 
 
 def _is_image_mask(doc: fitz.Document, xref: int) -> bool:
@@ -280,8 +368,8 @@ def _illustration_clusters(
     protected_rects: bounding boxes of checkboxes, rules, and panels (from pdf_processor
                      _rules/_vector_marks/_panels) that must be preserved. A cluster whose
                      bbox intersects one of these is dropped — unless the protected rect
-                     sits inside the cluster's own ink, in which case it is not furniture
-                     at all but a piece of the illustration (see below).
+                     sits inside the cluster's own ink, or is not furniture-shaped ink at
+                     all, in which cases it is a piece of the illustration (see below).
     image_placement_rects: placement rects of raster images on this page. Drawings >50%
                            contained in these are excluded from clustering (prevents
                            double-counting a decorative frame drawn over a photo).
@@ -298,6 +386,21 @@ def _illustration_clusters(
     # Crop marks and registration targets match the checkbox test exactly, and one sitting
     # in the paper margin would veto any region that reached up to the trim line.
     protected_rects = [pr for pr in protected_rects if not _in_trim_margin(pr, page)]
+
+    # Outlined letters and small icons also match the checkbox test exactly, and unlike a
+    # crop mark they sit in the middle of the artwork they belong to. Drop the ones whose
+    # ink is too intricate to be a box or a rule. See FURNITURE_MAX_ITEMS.
+    #
+    # Keyed on the rect because that is all `_vector_marks` hands back; several drawings can
+    # share one, and one furniture-shaped drawing among them is enough to keep the veto.
+    mark_ink: dict[tuple, bool] = {}
+    for drawing in drawings:
+        rect = fitz.Rect(drawing["rect"])
+        if not _is_mark_shaped(rect):
+            continue
+        key = tuple(rect)
+        mark_ink[key] = mark_ink.get(key, False) or _is_furniture_ink(drawing)
+    protected_rects = [pr for pr in protected_rects if mark_ink.get(tuple(pr), True)]
 
     # Exclude drawings that match the existing preservation rules
     # (checkboxes, rules, panels — via their exact size/shape criteria).
@@ -446,6 +549,17 @@ def _illustration_clusters(
         )
         content_key = hashlib.md5(str(content_sig).encode()).hexdigest()
 
+        # Rejecting a panel of words would leave it in English, which is the thing this
+        # module exists to prevent; it is only the *redrawing* of one that has to stop.
+        outlined_lines = _outlined_text_lines(cluster_drawings)
+        redraw_safe = outlined_lines + region_lines <= MAX_TEXT_LINES_IN_REGION
+        if not redraw_safe:
+            logger.info(
+                "Page %d: cluster at %s carries %d lines of drawn lettering — its text will be "
+                "translated but the artwork will not be regenerated",
+                page_num, bbox, outlined_lines,
+            )
+
         key = f"vec:{page_num}:{idx}"
         candidates.append(
             IllustrationRegion(
@@ -455,6 +569,7 @@ def _illustration_clusters(
                 rect=bbox,
                 item_count=item_count,
                 page_context="",  # filled in by localize_pdf when context is available
+                redraw_safe=redraw_safe,
             )
         )
 

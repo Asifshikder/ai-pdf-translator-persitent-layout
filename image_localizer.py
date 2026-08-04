@@ -20,8 +20,8 @@ from vertex_client import IMAGE_TIMEOUT_MS, generate_content
 logger = logging.getLogger(__name__)
 
 # Use available models only in this Vertex AI project
-CLASSIFY_MODEL = "gemini-2.5-flash"  # For classification and text translation
-TEXT_TRANSLATE_MODEL = "gemini-2.5-flash"  # For translating text to Bangla
+CLASSIFY_MODEL = "gemini-3-flash-preview"  # For classification and text translation
+TEXT_TRANSLATE_MODEL = "gemini-3-flash-preview"  # For translating text to Bangla
 
 # Image generation/editing models, tried in order. Ordered by measured framing fidelity: text is
 # restored onto blank surfaces at positions measured before the edit, so a model that shifts or
@@ -150,7 +150,7 @@ When the two readings are genuinely both arguable, answer "referential" — a pi
 when it should not have been is a factual error in the document, while one left alone is \
 merely un-localized."""
 
-# Two ways to regenerate a picture, chosen per image by image_processor._regeneration_mode:
+# Three ways to regenerate a picture, chosen per image by image_processor._regeneration_mode:
 #
 #   "context" — the page's own words go to the model with the picture, so what comes back
 #   still illustrates the paragraph it sits beside. A figure printed next to "walk for 20
@@ -161,7 +161,57 @@ merely un-localized."""
 #   context to give (a margin icon, a cover ornament, a picture on an otherwise blank
 #   divider): a context clause assembled from three stray words is worse than none, because
 #   the model reads whatever it is handed as a brief and draws to it.
-LOCALIZE_MODES = ("context", "simple")
+#
+#   "reimagine" — the picture is DRAWN AGAIN as a Bangladeshi scene rather than retouched.
+#   The other two modes pin every element to its original position, because text read off
+#   the original is painted back into those same boxes afterwards; an edit model handed
+#   "nothing moves and nothing resizes" complies the cheapest way it can, which is to change
+#   the faces and the clothes and leave the Western room, street, furniture and props exactly
+#   as drawn. That is the "only the characters changed" result. Where the picture carries no
+#   baked text there is nothing to line up with, so the frame can be freed: same message,
+#   same aspect ratio, same style and palette family, but the scene itself is composed from
+#   what the subject actually looks like in Bangladesh. See image_processor._regeneration_mode
+#   for the conditions — it is gated, not the default, because a recomposed picture and a
+#   fixed text overlay cannot both be right.
+LOCALIZE_MODES = ("context", "simple", "reimagine")
+
+# Concrete visual vocabulary, shared by every mode.
+#
+# "Make it Bangladeshi" is not an instruction a model can execute — asked for it and nothing
+# else, it does the one substitution it is certain of (skin, hair, a saree) and leaves the
+# rest of the frame as it found it. Naming the props is what actually moves a picture: a
+# model that has been told "rickshaw, tin roof, ceiling fan, steel plate, cha in a glass cup"
+# draws a Bangladeshi room, while one told "adapt the setting" draws a Western room with a
+# Bangladeshi person in it. Same reason the palette is given as measured hex values rather
+# than as "match the original" — see image_processor._palette_summary.
+BANGLADESHI_VOCABULARY = """WHAT "BANGLADESHI" LOOKS LIKE — draw from this, do not stop at \
+skin and clothing:
+  - PEOPLE: Bengali faces — rounded jaw, broad nose, dark brown eyes, thick black hair; warm \
+brown skin across a real range from fair-wheatish to deep brown. Not East Asian, not Arab, \
+not a tanned European.
+  - DRESS: women in a cotton saree worn with the anchol over the shoulder, or a salwar kameez \
+with the orna across the chest, many with a hijab; men in a panjabi with pyjama, a shirt with \
+full trousers, or a lungi with a shirt or genji, some in a topi; older men often with a \
+beard; children in school uniform, girls with plaited hair and ribbons. Sandals or chappals, \
+not trainers, indoors nothing on the feet.
+  - HOMES: brick or plastered walls painted pale green, blue or cream; a corrugated tin roof \
+or a flat concrete one; cement or red-oxide floors; a ceiling fan; a mosquito net over a \
+wooden khat; plastic moulded chairs, a wooden almirah, a calendar and a wall clock; a \
+jaynamaz; steel or melamine crockery; a jug and glass on a tray.
+  - STREETS AND VILLAGES: cycle rickshaws with painted hoods, green CNG auto-rickshaws, \
+crowded buses, vans and hawker carts; a tea stall with a kettle and small glass cups; shops \
+behind corrugated shutters; tangled overhead cables; brick-paved lanes; a mosque minaret; \
+a pond (pukur) with steps down to it, paddy fields, banana, coconut and betel-nut palms, \
+bamboo, a river with a wooden nouka, a monsoon sky.
+  - HEALTH SETTINGS: a community clinic or upazila health complex — pale green or white \
+painted walls, a metal bed with a plain sheet, a curtain rail, a wooden desk; a doctor in a \
+white coat over a saree or a panjabi; a health worker or paramedic with a register; not a \
+Western hospital corridor.
+  - FOOD: bhat, dal, machher jhol with rui or ilish, shobji bhaji, ruti, khichuri, doi, muri; \
+cha in a small glass cup; seasonal fruit — aam, kathal, kola, peyara, boroi; served on steel \
+or melamine plates and eaten with the right hand, or with a steel spoon.
+Draw Bangladesh specifically, not a generic "South Asian" or "Middle Eastern" stand-in: no \
+desert, no pagoda, no Gulf skyline, no Western suburban kitchen or lawn."""
 
 CONTEXT_CLAUSE = """CONTEXT — the page this picture is printed on says:
 "{context}"
@@ -201,12 +251,57 @@ keep exactly that style — do not turn it into a photo, a painting, or a shaded
 - Clarity: the output must be CLEARER than the original — cleaner and steadier lines, \
 sharper edges, better-resolved detail, no blur or compression artifacts. Clarity comes \
 from draughtsmanship, not from stronger colour: sharpen the drawing, not the palette.
-- People: Make any visible people Bangladeshi with appropriate attire (saree, salwar \
-kameez, panjabi, hijab, lungi, or traditional wear as fitting for age/gender/context). \
-Use skin tones and features consistent with Bangladeshi people. Keep poses, gestures and \
-expressions as engaged and natural as the original's, and rendered in the original's style.
-- Settings & objects: Adapt architecture, vehicles, streets, buildings, furniture, and \
-household items to look Bangladeshi — but drawn in the original's palette and style.
+CRITICAL — PEOPLE ARE REDRAWN, NOT RE-DRESSED:
+  - Every visible person must BE Bangladeshi, not a Western person wearing Bangladeshi \
+clothes. Changing only the clothing is the most common failure and is not acceptable.
+  - Redraw the person: face shape, nose, lips, eyes, brow and jaw as a Bangladeshi person's; \
+warm brown South Asian skin, and black or dark brown hair with South Asian hair texture. No \
+blond, red, ginger or light-brown hair, no blue or green eyes, no pale or pink complexion, \
+no Western facial structure.
+  - Facial hair, hairstyle and any head covering should read as they would in Bangladesh for \
+that person's age, gender and role.
+  - THEN dress them: saree, salwar kameez, panjabi, kurta, hijab, lungi, or ordinary modern \
+Bangladeshi clothing as fits their age, gender and context.
+  - Keep the same number of people, the same poses, gestures, expressions and positions, at \
+the same size and in the original's drawing style. It is the person who changes, not the \
+picture's composition. The one exception is the behaviour rules below: where they require a \
+change, adjust only the limbs, clothing or spacing involved and leave the composition, the \
+count and everyone's place in the frame untouched.
+CRITICAL — BEHAVIOUR MUST FIT BANGLADESH, NOT ONLY APPEARANCE:
+  - A Bangladeshi-looking person acting out a Western scene is the same failure as a Western \
+face in a saree. What the people are doing, what they are wearing and how they touch each \
+other must read as ordinary and respectable in Bangladesh.
+  - MODESTY — everyone is covered. Women wear a saree, a salwar kameez with the orna over the \
+chest, or other loose full-length clothing: shoulders, arms, chest, midriff and legs covered. \
+Men wear a shirt with full trousers, pyjama or lungi, and are not bare-chested. No shorts, \
+vests, sleeveless or low-cut tops, clinging fits, short skirts, swimwear or gym-wear, and no \
+bare legs — this holds during exercise, sport, swimming, at the beach and at home. Draw the \
+SAME activity in modest, covered clothing rather than dropping the activity.
+  - CONTACT BETWEEN MEN AND WOMEN — none. No hugging, kissing, cheek-kissing, hand-holding, \
+an arm around a shoulder or waist, sitting in a lap, or leaning on one another. A husband and \
+wife, a carer and a patient, a doctor and a patient stand or sit side by side at a respectful \
+distance. Contact within the same gender (a hand on a friend's shoulder) and a parent holding \
+their own young child are normal and stay.
+  - MANNERS — eat, give and receive with the right hand; feet stay off tables, chairs and \
+desks and soles are not turned towards anyone; people greet with salam or a nod, not a kiss \
+or an embrace; older people are shown being deferred to.
+  - SETTINGS THAT CARRY BEHAVIOUR — a pub, bar, nightclub, dance floor, sunbathing or beach \
+scene becomes the Bangladeshi setting that serves the same purpose (a tea stall, a home \
+sitting room, a park or riverside walk, a community hall), with the same activity and the \
+same number of people. No dogs indoors, on a lap or on furniture.
+  - This never overrides the picture's health message: if the booklet is deliberately showing \
+a habit to avoid, it still shows it. Adapt how people behave, not what the page is teaching.
+CRITICAL — THE WHOLE FRAME IS LOCALIZED, NOT ONLY THE PEOPLE:
+  - Changing the faces and the clothing and leaving the room, the street, the furniture, the \
+crockery and the props exactly as they were drawn is the single most common failure of this \
+task, and the result is rejected. A Bangladeshi family in a Western kitchen is not localized.
+  - Every object in the frame that a Bangladeshi household or street would not contain is \
+replaced by the thing that fills the same role there — in the same position, at the same \
+size, in the original's palette and style. Walls, floors, roofing, windows, doors, furniture, \
+crockery, utensils, appliances, vehicles, shopfronts, signage shapes, trees and plants are \
+all in scope, not just the people.
+  - Work through the frame element by element and ask of each one: is this what it would look \
+like in Bangladesh? Anything that would not be there is redrawn.
 CRITICAL — FOOD RULES. All three apply, in this order:
   1. HALAL ONLY. Never depict pork, ham, bacon, lard, alcohol, beer, wine, or a wine glass. \
 If the original shows one, replace it with a halal food filling the same role.
@@ -230,6 +325,7 @@ CRITICAL — NO LOGOS:
 badge, or institutional mark. Never substitute a different organisation's mark for the one there.
   - Leave the area a mark occupies as clean, empty background of the surrounding colour. The \
 original marks are stamped back on top afterwards, unchanged.
+{vocabulary}
 Do not add or remove objects, change the layout, or add new elements beyond cultural \
 adaptation. Keep all text surfaces present but empty. Focus especially on: {focus}."""
 
@@ -247,8 +343,17 @@ signs, boards and panels keep their edges to the pixel — text is printed onto 
 at fixed positions, so one that moves or shrinks leaves that text overlapping the artwork.
 - Keep the SAME colour palette, the same style, and the same background colour as the \
 original.{palette} Do not brighten, restyle, or turn a flat drawing into a photo.
-- People become Bangladeshi: skin tones, features, and dress (saree, salwar kameez, panjabi, \
-hijab, lungi) suited to their age and role.
+- Every person must BE Bangladeshi, not a Western person in Bangladeshi clothes — redrawing \
+only the outfit is a failure. Redraw the face itself: South Asian face shape and features, \
+warm brown skin, black or dark brown hair. No blond or light hair, no pale complexion, no \
+Western facial structure. Then dress them (saree, salwar kameez, panjabi, kurta, hijab, \
+lungi) to suit their age and role. Same poses, same positions, same count.
+- Behaviour must fit Bangladesh too, not just faces. Everyone is modestly covered — no \
+shorts, sleeveless or low-cut tops, tight fits, swimwear, gym-wear or bare legs, not even \
+while exercising or swimming — and a man and a woman are never shown touching: no hugging, \
+kissing, hand-holding or an arm round a shoulder; they stand side by side instead. Same \
+gender contact and a parent holding their own child are fine. Change only the clothing and \
+the touching — the activity, the poses and the number of people stay as they are.
 - Food becomes Bangladeshi and halal — never pork, alcohol, beer or wine — and stays in the \
 SAME food group and the SAME portion as the original (oily fish -> ilish or rui, wholegrain \
 -> lal chal or atta ruti, pulse -> dal, dairy -> doi), served in Bangladeshi dishes.
@@ -256,6 +361,116 @@ SAME food group and the SAME portion as the original (oily fish -> ilish or rui,
 — the text is restored separately afterwards.
 - Draw NO logo, wordmark, emblem, crest or institutional mark, and never invent or substitute \
 one. Leave its area clean and empty; the original mark is stamped back afterwards, unchanged.
+- The whole frame is localized, not only the people. Changing the faces and the clothes while \
+the room, the street, the furniture, the crockery and the props stay Western is a failure. \
+Every object is replaced by what fills the same role in Bangladesh — same position, same \
+size, same style: brick or plastered walls and a tin roof, cement floors, a ceiling fan, \
+plastic chairs and a wooden khat, steel or melamine plates, cha in a small glass cup, bhat \
+and dal and machher jhol, cycle rickshaws and CNG auto-rickshaws, tea stalls, paddy fields, \
+banana and coconut palms, a pond. Bangladesh specifically — not a generic South Asian, Middle \
+Eastern or Western stand-in.
+Focus especially on: {focus}."""
+
+# "reimagine" mode. The picture is drawn again from its meaning rather than edited, so the
+# clause that carries the page's words is worded differently too: in the other two modes the
+# context is a fence ("keep the meaning intact"), and here it is the brief. It is still not a
+# licence to write any of those words into the image.
+REIMAGINE_CONTEXT_CLAUSE = """THE BRIEF — this picture is printed on a page that says:
+"{context}"
+The picture exists to illustrate that. Everything you draw must serve it: the same subject, \
+the same activity, the same point being made to the reader. This is what the picture is FOR, \
+not a list of objects to include, and not one word of it may appear as text in the image.
+"""
+
+# Written as a *drawing* brief, not an editing one. The edit prompts above are built around a
+# text overlay that is painted back at coordinates measured on the original, so they spend
+# most of their length forbidding movement — and a model told to move nothing satisfies the
+# cultural instruction with the cheapest possible change, the faces and the clothes. This
+# prompt is used only where the picture carries no baked text (image_processor gates it), so
+# the frame is free and the instruction can ask for the thing that was actually wanted: the
+# scene as it exists in Bangladesh. What it still may not change is what makes the picture fit
+# the printed page — aspect ratio, drawing style, palette — and what makes it true: the health
+# message, the food group, the number of people doing the thing.
+REIMAGINE_INSTRUCTION = """Draw this picture again as it would be drawn for a health booklet \
+published in Bangladesh, for Bangladeshi readers.
+{context_clause}
+CRITICAL — THIS IS A REDRAW, NOT A RETOUCH:
+  - Do not trace the original and swap the faces. Look at what the picture is showing, then \
+draw that same thing as it actually happens in Bangladesh — the people, and also the place \
+they are in, what they are wearing, what they are holding, what is behind them and what is \
+under their feet.
+  - A picture that has kept its Western room, street, furniture, crockery, vehicles or \
+landscape and changed only the skin, hair and clothing has FAILED this task. That is the \
+specific outcome this instruction exists to prevent.
+  - You may recompose within the frame: move, resize, add or drop background and secondary \
+elements, change the setting, change the props, change the camera distance, so long as the \
+result still says exactly what the original said.
+
+WHAT MUST NOT CHANGE:
+  - THE MESSAGE. Whatever the original teaches the reader, the new picture teaches. The same \
+activity, the same situation, the same instruction being illustrated.
+  - THE PEOPLE COUNT AND THEIR ROLES. The same number of people, the same ages and genders, \
+in the same relationship to each other (a doctor and a patient stay a doctor and a patient).
+  - THE ASPECT RATIO AND SIZE. Return the picture at exactly the aspect ratio and dimensions \
+you were given. Do not pad it, do not crop it to a square or a 2:3 frame. It is printed into \
+a fixed rectangle on a page.
+  - THE DRAWING STYLE. If the original is a flat vector illustration, a line drawing, a \
+two-colour graphic or a watercolour, the new picture is the same kind of drawing, at the same \
+level of detail. Do not turn an illustration into a photograph or a 3D render, and do not \
+turn a photograph into a cartoon.
+  - THE PALETTE. This picture is printed inside a document and has to look like it belongs to \
+the page around it. Use the same hues, the same lightness, the same saturation, the same \
+overall tone as the original.{palette} A plain background stays plain and stays its original \
+colour; a white background stays white. Do not boost saturation or add new accent colours.
+  - THE QUALITY. Cleaner and steadier lines than the original, sharper edges, well-resolved \
+detail, no blur and no compression artifacts.
+
+{vocabulary}
+
+CRITICAL — BEHAVIOUR MUST FIT BANGLADESH, NOT ONLY APPEARANCE:
+  - MODESTY — everyone is covered. Women wear a saree, a salwar kameez with the orna over the \
+chest, or other loose full-length clothing: shoulders, arms, chest, midriff and legs covered. \
+Men wear a shirt with full trousers, pyjama or lungi, and are not bare-chested. No shorts, \
+vests, sleeveless or low-cut tops, clinging fits, short skirts, swimwear or gym-wear, and no \
+bare legs — this holds during exercise, sport, swimming, at the beach and at home. Draw the \
+SAME activity in modest, covered clothing rather than dropping the activity.
+  - CONTACT BETWEEN MEN AND WOMEN — none. No hugging, kissing, hand-holding, an arm around a \
+shoulder or waist, sitting in a lap or leaning on one another. A husband and wife, a carer \
+and a patient, a doctor and a patient stand or sit side by side at a respectful distance. \
+Contact within the same gender and a parent holding their own young child are normal and stay.
+  - MANNERS — eat, give and receive with the right hand; feet stay off tables, chairs and \
+desks and soles are not turned towards anyone; people greet with salam or a nod, not a kiss \
+or an embrace; older people are shown being deferred to.
+  - SETTINGS THAT CARRY BEHAVIOUR — a pub, bar, nightclub, dance floor, sunbathing or beach \
+scene becomes the Bangladeshi setting that serves the same purpose: a tea stall, a home \
+sitting room, a park or riverside walk, a community hall. No dogs indoors, on a lap or on \
+furniture.
+  - This never overrides the picture's health message: if the booklet is deliberately showing \
+a habit to avoid, it still shows it. Adapt how people behave, not what the page is teaching.
+
+CRITICAL — FOOD RULES. All three apply, in this order:
+  1. HALAL ONLY. Never depict pork, ham, bacon, lard, alcohol, beer, wine, or a wine glass. \
+If the original shows one, replace it with a halal food filling the same role.
+  2. KEEP THE NUTRITIONAL MEANING. A food in a health booklet usually stands for a food group, \
+a portion size or a measure. The replacement must be in the SAME food group and show the SAME \
+portion: oily fish -> ilish or rui (never dal); wholegrain -> lal chal or atta ruti (never \
+white rice); leafy vegetable -> lal shak or palong shak; pulse -> dal; dairy -> doi or milk; \
+fruit -> a fruit. Never swap across food groups, and never change how much food is shown or \
+how many items are on the plate.
+  3. MAKE IT BANGLADESHI. Subject to 1 and 2, everyday Bangladeshi food on Bangladeshi \
+crockery, eaten the way it is eaten there.
+
+CRITICAL — NO TEXT:
+  - Draw NO text, letters, words, numbers or symbols anywhere, in any script.
+  - Every sign, placard, board, label or poster you draw comes back BLANK and CLEAN — empty \
+board or paper of a plausible shape, colour and material, with no glyphs of any kind.
+  - Signage in a Bangladeshi street scene is drawn as blank painted boards and shutters, not \
+as lettering. The booklet's real text is printed separately, so leaving it out is required.
+
+CRITICAL — NO LOGOS:
+  - Draw NO logo, wordmark, emblem, crest, badge or institutional mark, and never invent one \
+or substitute a real organisation's mark. Leave such areas as clean, empty background.
+
 Focus especially on: {focus}."""
 
 # The cover is a whole printed page, not a picture inside one, and that changes what has to
@@ -270,10 +485,22 @@ the same places, the same aspect ratio, the same overall design. This must still
 recognisably the same booklet, not a new design.
 - Keep the SAME colour palette as the original — the same background colours, the same \
 accent colours, the same tone.{palette} Do not restyle or rebrand it.
-- Any people become Bangladeshi in appearance and dress (saree, salwar kameez, panjabi, \
-hijab, lungi), keeping their poses, positions and scale.
+- Every person must BE Bangladeshi, not a Western person wearing Bangladeshi clothes. \
+Redraw the face itself — South Asian face shape and features, warm brown skin, black or dark \
+brown hair, no blond or light hair and no pale complexion — and then dress them (saree, \
+salwar kameez, panjabi, kurta, hijab, lungi) as fits their age and role. Keep their poses, \
+positions, scale and the original's drawing style.
+- Their behaviour must fit Bangladesh as well as their faces. Everyone is modestly covered \
+— no shorts, sleeveless or low-cut tops, tight fits, swimwear, gym-wear or bare legs, even \
+when exercising — and a man and a woman are not shown touching: no hugging, kissing, \
+hand-holding or an arm round a shoulder; they stand side by side at a respectful distance. \
+Same-gender contact and a parent holding their own child are normal and stay. Adjust only \
+the clothing and the touching; the activity, the count and the layout do not change.
 - Any setting, building, vehicle, food or object becomes its Bangladeshi equivalent, drawn \
-in the original's style.
+in the original's style. A pub, bar, dance floor or beach scene becomes the Bangladeshi \
+setting that serves the same purpose. Changing the faces and the clothing while the rooms, \
+streets, furniture and props stay Western is a failure — the whole cover is localized.
+{vocabulary}
 CRITICAL — NO TEXT ANYWHERE:
   - Draw NO letters, words, numbers, logos or symbols. Not in the title area, not on the \
 artwork, not in the footer.
@@ -385,27 +612,38 @@ _TEXT_BLOCKS_SCHEMA = {
                 "properties": {
                     "text": {"type": "STRING"},
                     "lang": {"type": "STRING"},
-                    "bbox": {
+                    "box_2d": {
                         "type": "ARRAY",
-                        "items": {"type": "NUMBER"},
+                        "items": {"type": "INTEGER"},
                         "minItems": 4,
                         "maxItems": 4,
                     },
                 },
-                "required": ["text", "lang", "bbox"],
+                "required": ["text", "lang", "box_2d"],
             },
         }
     },
     "required": ["blocks"],
 }
 
+# Boxes are asked for as `box_2d` — [y0, x0, y1, x1] on a 0-1000 grid — and not as the
+# fractions of width and height this function returns, because that is the convention the
+# model was trained to answer in and it is markedly better at it.
+#
+# Measured on the exercise panel from the Revascularisation manual, a 1334x440 graphic
+# (3.0:1) holding twelve lines. Asked for fractions it found ten of the twelve and put them
+# roughly a line and a half low — "increase blood flow to your heart muscle" came back at
+# 0.50-0.58 of the height when it is printed at 0.27-0.33 — and two runs of the identical
+# request at temperature 0 disagreed with each other. Asked for box_2d it found all twelve,
+# twice, identically, with every line within a few percent of its ink. Nothing else about
+# the request changed.
 _TEXT_BLOCKS_PROMPT = (
-    "Find every distinct block of visible text in this image (signs, placards, labels, headings, "
-    "captions, words). For each block return: 'text' (the exact text as it appears, one block's "
-    "lines joined with spaces), 'lang' (ISO code of its language — 'en' for English, 'bn' for "
-    "Bangla, 'hi' for Hindi, etc.), and 'bbox' as [x0, y0, x1, y1] with each value a fraction "
-    "between 0 and 1 of the image width/height (x0,y0 = top-left corner, x1,y1 = bottom-right). "
-    "Return an empty list if there is no text."
+    "Detect every distinct block of visible text in this image (signs, placards, labels, "
+    "headings, captions, words). For each block return: 'text' (the exact text as it appears, "
+    "one block's lines joined with spaces), 'lang' (ISO code of its language — 'en' for "
+    "English, 'bn' for Bangla, 'hi' for Hindi, etc.), and 'box_2d' as [y0, x0, y1, x1] "
+    "integers on a 0-1000 grid of the image height/width (y0,x0 = top-left corner, "
+    "y1,x1 = bottom-right). Return an empty list if there is no text."
 )
 
 
@@ -452,15 +690,26 @@ def _extract_text_blocks(image_bytes: bytes, mime: str, notes: dict | None = Non
     """Structured OCR: return a list of {"text", "lang", "bbox": [x0,y0,x1,y1]} blocks, with bbox
     normalized to 0..1 of image dimensions.
 
-    Retried, because the one thing this must not do is confuse "no text" with "the request
-    failed". Both used to return [] on a single attempt with the reason logged at debug level,
-    so a transient error on a picture full of labels read as a picture with no labels — and
-    since the edit model is separately told to blank every text surface, the words were then
-    deleted rather than translated. That is what happened to the eatwell plate's food-group
-    labels: regenerated correctly, captions gone, nothing in the log.
+    Pass `notes` to tell "no text" from "the request failed" apart: `notes` gets
+    "ocr_failed": True only when the request failed, and the caller can then decline to
+    blank a picture whose words it could not read.
+    """
+    blocks = _ocr_once(image_bytes, mime)
+    if blocks is None:
+        if notes is not None:
+            notes["ocr_failed"] = True
+        return []
+    return blocks
 
-    Pass `notes` to tell the two apart: on total failure it gets "ocr_failed": True, and the
-    caller can decline to blank a picture whose words it could not read.
+
+def _ocr_once(image_bytes: bytes, mime: str) -> list[dict] | None:
+    """One structured-OCR call, retried. None when every attempt failed, [] when there is
+    no text — a distinction the callers depend on.
+
+    Both used to be []: a transient error on a picture full of labels read as a picture with
+    no labels, and since the edit model is separately told to blank every text surface, the
+    words were then deleted rather than translated. That is what happened to the eatwell
+    plate's food-group labels: regenerated correctly, captions gone, nothing in the log.
     """
     for attempt in range(1, OCR_ATTEMPTS + 1):
         # Retrying the identical request is the one thing that does not work here: the
@@ -486,11 +735,15 @@ def _extract_text_blocks(image_bytes: bytes, mime: str, notes: dict | None = Non
             cleaned: list[dict] = []
             for b in blocks:
                 text = (b.get("text") or "").strip()
-                bbox = b.get("bbox") or []
-                if not text or len(bbox) != 4:
+                box_2d = b.get("box_2d") or []
+                if not text or len(box_2d) != 4:
                     continue
-                # Clamp to [0,1] and ensure a valid, non-empty rect.
-                x0, y0, x1, y1 = (min(max(float(v), 0.0), 1.0) for v in bbox)
+                # box_2d is [y0, x0, y1, x1] on a 0-1000 grid; the rest of the pipeline
+                # works in [x0, y0, x1, y1] fractions. Clamped, and empty rects dropped.
+                top, left, bottom, right = (
+                    min(max(float(v) / 1000.0, 0.0), 1.0) for v in box_2d
+                )
+                x0, y0, x1, y1 = left, top, right, bottom
                 if x1 <= x0 or y1 <= y0:
                     continue
                 cleaned.append({
@@ -506,9 +759,7 @@ def _extract_text_blocks(image_bytes: bytes, mime: str, notes: dict | None = Non
             )
     logger.error("Text-block OCR failed after %d attempts — the image's words are unknown",
                  OCR_ATTEMPTS)
-    if notes is not None:
-        notes["ocr_failed"] = True
-    return []
+    return None
 
 
 _LOGO_REGIONS_SCHEMA = {
@@ -605,28 +856,43 @@ def _is_valid_bangla(text: str) -> bool:
     return bangla_chars > 0 and (bangla_chars / len(text)) > 0.3
 
 
+# The per-block fallback, used when translate_blocks could not answer for a block. It is the
+# one translation path with no picture to look at, so the register it has to match — the same
+# চলিত/আপনি voice as translator.SYSTEM_PROMPT — has to be stated outright. Left to "natural,
+# proper, clear Bangla" it wrote a different, more formal Bangla than the page around it.
+_SINGLE_BLOCK_PROMPT = """This is a line of text printed inside a picture in a health booklet \
+being republished in Bangladesh. Translate it into Bangla for a patient reading it — an ordinary \
+person, often elderly, not a doctor.
+
+- Bangladeshi Bangla, modern colloquial চলিত. Never সাধু ভাষা. Address the reader as আপনি.
+- The plainest everyday word, never a bookish one and never a transliterated abbreviation
+  (GP is ডাক্তার, never জিপি).
+- Say it the way a Bangla speaker would say it, not word by word after the English.
+- This is a label or caption, so keep it short — about as long as the English.
+- Keep every number, unit and symbol exactly as printed, in Latin digits: "3 units" is
+  "3 ইউনিট", never "তিন". A number that has lost its unit is a clinical error in this document.
+- A brand, an organisation, a drug name or a person's name stays in Latin script.
+- Return only the Bangla. No English, no explanation, no quotation marks.
+
+English: {text}"""
+
+
 def _translate_to_bangla(text: str) -> str:
-    """Translate English text to Bangla using Gemini 1.5 Pro with retries."""
+    """Translate one English string to Bangla, with retries and a Bangla-output check."""
     if not text or not text.strip():
         return text
 
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
-            # Adjust temperature for each retry
-            temperature = 0.1 + (attempt - 1) * 0.1
-
             response = generate_content(
                 model=TEXT_TRANSLATE_MODEL,
-                contents=[
-                    f"Translate this English text to natural, proper, clear Bangla. "
-                    f"Use correct Bangla spelling and pronunciation. "
-                    f"Preserve meaning, style, and tone. "
-                    f"Return ONLY the Bangla translation, nothing else. "
-                    f"Do not include English text or explanations.\n\n"
-                    f"English: {text}"
-                ],
-                config=types.GenerateContentConfig(temperature=temperature),
+                contents=[_SINGLE_BLOCK_PROMPT.format(text=text)],
+                # Gemini 3 default. The old ladder climbed 0.1 → 0.3 to shake a
+                # different answer out of a retry, which a near-greedy model needs
+                # and this one does not: at 1.0 each attempt already differs, and
+                # tuning it down degrades the reasoning pass.
+                config=types.GenerateContentConfig(temperature=1.0),
             )
             bangla_text = response.text.strip()
 
@@ -683,6 +949,13 @@ each one into natural, everyday Bangla for a Bangladeshi patient.
 Look at the picture before you answer. It tells you what each piece of text is doing: a \
 heading, a caption under a drawing, the name of a food group, a figure printed beside the \
 thing it measures.
+
+The reader is a patient — an ordinary person, often elderly, not a doctor — and this text sits \
+in a booklet whose pages are already in Bangla. Write the same voice the pages use: Bangladeshi \
+modern colloquial চলিত, never সাধু ভাষা, the reader addressed as আপনি, and the plainest everyday \
+word rather than a bookish one. Say each label the way a Bangla speaker would say it out loud, \
+not word by word after the English. Never use a transliterated English abbreviation — GP is \
+ডাক্তার, never জিপি.
 
 Rules:
 - Return one entry for every index, with the same index numbers. Never merge two entries, \
@@ -755,7 +1028,10 @@ def translate_blocks(
                     ),
                 ],
                 config=types.GenerateContentConfig(
-                    temperature=0.0 + 0.2 * (attempt - 1),
+                    # Gemini 3 default; the retry no longer needs a temperature
+                    # ladder to come back with something different (see
+                    # _translate_to_bangla).
+                    temperature=1.0,
                     response_mime_type="application/json",
                     response_schema=_BLOCK_TRANSLATION_SCHEMA,
                 ),
@@ -842,8 +1118,11 @@ def localize_image(
     page's palette far better than asking it to "match the original" — left to itself it
     returns a warmer, more saturated picture that reads as pasted in from another book.
 
-    `mode` is "context" (the page's own words steer what is drawn) or "simple" (a compact
-    cultural swap with no page text). See LOCALIZE_MODES for when each applies.
+    `mode` is "context" (the page's own words steer what is drawn), "simple" (a compact
+    cultural swap with no page text), or "reimagine" (the scene is drawn again as a
+    Bangladeshi one rather than retouched in place). See LOCALIZE_MODES for when each
+    applies — "reimagine" is only ever chosen for a picture with no baked text, because it
+    is free to recompose and there is then nothing for a text overlay to line up with.
 
     `notes` is a dict the failure reason is written into — pass the caller's audit record so
     that a picture lost to quota is distinguishable from one the model refused.
@@ -854,7 +1133,16 @@ def localize_image(
     palette_note = f"\n  - {palette}" if palette.strip() else ""
     context = page_context.strip()
 
-    if mode == "simple" or not context:
+    if mode == "reimagine":
+        instruction = REIMAGINE_INSTRUCTION.format(
+            focus=focus,
+            palette=palette_note,
+            vocabulary=BANGLADESHI_VOCABULARY,
+            context_clause=(
+                REIMAGINE_CONTEXT_CLAUSE.format(context=context) if context else ""
+            ),
+        )
+    elif mode == "simple" or not context:
         instruction = SIMPLE_EDIT_INSTRUCTION.format(focus=focus, palette=palette_note)
     else:
         # The image model must NOT draw any text — it garbles glyphs (especially Bangla) and
@@ -869,6 +1157,7 @@ def localize_image(
             focus=focus,
             text_instruction=text_instruction,
             palette=palette_note,
+            vocabulary=BANGLADESHI_VOCABULARY,
             context_clause=CONTEXT_CLAUSE.format(context=context),
         )
 
@@ -891,6 +1180,7 @@ def localize_cover(
     context = page_context.strip()
     instruction = COVER_INSTRUCTION.format(
         palette=f"\n  - {palette}" if palette.strip() else "",
+        vocabulary=BANGLADESHI_VOCABULARY,
         context_clause=CONTEXT_CLAUSE.format(context=context) if context else "",
     )
     return _run_edit_models(instruction, image_bytes, mime)

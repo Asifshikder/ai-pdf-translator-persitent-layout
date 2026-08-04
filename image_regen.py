@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 REGEN_SUFFIX = "_regen.pdf"  # keep in sync with MODES.regenerate.suffix in static/index.html
 
-CLASSIFY_MODEL = "gemini-2.5-flash"
+CLASSIFY_MODEL = "gemini-3-flash-preview"
 # Image models tried in order. Ordered by measured *fidelity of framing*, not by tier, because
 # this pipeline measures OCR boxes on the original and paints Bangla into the regenerated copy —
 # so a model that reframes the picture puts that text off its sign. Measured on the cover figure
@@ -189,10 +189,69 @@ CRITICAL — FOOD RULES. All three apply, in this order:
 
 PEOPLE: any visible person becomes Bangladeshi in skin tone and features, dressed as fits their
 age, gender and role (saree, salwar kameez, panjabi, hijab, lungi, or ordinary modern clothes).
-Keep their poses, gestures and expressions exactly as engaged and natural as the original's.
+Keep their poses, gestures and expressions exactly as engaged and natural as the original's,
+except where the behaviour rules below require a change.
 
-SETTINGS & OBJECTS: architecture, streets, vehicles, rooms, furniture and household items become
-Bangladeshi — drawn in the original's palette and style, not photographed anew.
+CRITICAL — BEHAVIOUR MUST FIT BANGLADESH, NOT ONLY APPEARANCE:
+  - A Bangladeshi-looking person acting out a Western scene is the same failure as a Western
+    face in a saree. What the people are doing, what they wear and how they touch each other
+    has to read as ordinary and respectable in Bangladesh.
+  - MODESTY — everyone is covered. Women wear a saree, a salwar kameez with the orna over the
+    chest, or other loose full-length clothing: shoulders, arms, chest, midriff and legs
+    covered. Men wear a shirt with full trousers, pyjama or lungi, and are not bare-chested.
+    No shorts, vests, sleeveless or low-cut tops, clinging fits, short skirts, swimwear or
+    gym-wear, and no bare legs — this holds during exercise, sport, swimming, at the beach and
+    at home. Draw the SAME activity in modest, covered clothing rather than dropping it.
+  - CONTACT BETWEEN MEN AND WOMEN — none. No hugging, kissing, cheek-kissing, hand-holding, an
+    arm around a shoulder or waist, sitting in a lap, or leaning on one another. A husband and
+    wife, a carer and a patient, a doctor and a patient stand or sit side by side at a
+    respectful distance. Contact within the same gender (a hand on a friend's shoulder) and a
+    parent holding their own young child are normal and stay.
+  - MANNERS — eat, give and receive with the right hand; feet stay off tables, chairs and
+    desks and soles are not turned towards anyone; people greet with salam or a nod, not a
+    kiss or an embrace; older people are shown being deferred to.
+  - SETTINGS THAT CARRY BEHAVIOUR — a pub, bar, nightclub, dance floor, sunbathing or beach
+    scene becomes the Bangladeshi setting that serves the same purpose (a tea stall, a home
+    sitting room, a park or riverside walk, a community hall), with the same activity and the
+    same number of people. No dogs indoors, on a lap or on furniture.
+  - Adjust only the clothing, the touching and the spacing this calls for — the composition,
+    the number of people and their places in the frame do not change.
+  - This never overrides the picture's health message: if the booklet is deliberately showing
+    a habit to avoid, it still shows it. Adapt how people behave, not what the page teaches.
+
+CRITICAL — THE WHOLE FRAME IS LOCALIZED, NOT ONLY THE PEOPLE:
+  - Changing the faces and the clothing and leaving the room, the street, the furniture, the
+    crockery and the props exactly as drawn is the commonest failure of this task and the
+    result is rejected. A Bangladeshi family in a Western kitchen is not localized.
+  - Every object a Bangladeshi household or street would not contain is replaced by whatever
+    fills the same role there — same position, same size, original palette and style. Walls,
+    floors, roofing, windows, furniture, crockery, utensils, appliances, vehicles, shopfronts,
+    trees and plants are all in scope, not just the people. Go through the frame element by
+    element and ask of each: is this what it would look like in Bangladesh?
+  - What Bangladesh looks like, to draw from rather than guess at:
+      PEOPLE — Bengali faces, rounded jaw, broad nose, dark brown eyes, thick black hair, warm
+      brown skin from fair-wheatish to deep brown. Not East Asian, not Arab, not a tanned
+      European.
+      DRESS — a cotton saree with the anchol over the shoulder, a salwar kameez with the orna
+      across the chest, many women in a hijab; men in a panjabi and pyjama, a shirt with full
+      trousers, or a lungi with a shirt or genji, some in a topi; children in school uniform.
+      Sandals or chappals, bare feet indoors.
+      HOMES — plastered walls in pale green, blue or cream; a corrugated tin or flat concrete
+      roof; cement floors; a ceiling fan; a mosquito net over a wooden khat; plastic moulded
+      chairs, a wooden almirah, a wall calendar and clock, a jaynamaz; steel or melamine
+      crockery.
+      STREETS AND VILLAGES — cycle rickshaws, green CNG auto-rickshaws, crowded buses, hawker
+      carts, a tea stall with a kettle and small glass cups, corrugated shop shutters, tangled
+      overhead cables, brick lanes, a mosque minaret, a pond with steps, paddy fields, banana
+      and coconut and betel-nut palms, bamboo, a wooden nouka on a river, a monsoon sky.
+      HEALTH SETTINGS — a community clinic or upazila health complex: pale green or white
+      walls, a metal bed with a plain sheet, a curtain rail, a wooden desk; a doctor in a white
+      coat over a saree or panjabi; a health worker with a register. Not a Western hospital.
+      FOOD — bhat, dal, machher jhol with rui or ilish, shobji bhaji, ruti, khichuri, doi,
+      muri; cha in a small glass cup; aam, kathal, kola, peyara; on steel or melamine plates,
+      eaten with the right hand or a steel spoon.
+    Draw Bangladesh specifically, not a generic "South Asian" or "Middle Eastern" stand-in:
+    no desert, no pagoda, no Gulf skyline, no Western suburban kitchen or lawn.
 
 CRITICAL — NO TEXT:
   - Do NOT draw, write, render or hallucinate ANY text, letters, words, numbers or symbols.

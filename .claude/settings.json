@@ -220,7 +220,13 @@
       "Bash(grep -vE \"^INFO:fix_processor:Page .* — repairing$\")",
       "Bash(grep -n 'print..\\\\\\\\nText growth around pictures' -B 3 -A 4 test_layout.py)",
       "Bash(PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -m py_compile image_processor.py image_localizer.py image_regions.py)",
-      "Bash(PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -m uvicorn app:app --port 8030 --host 127.0.0.1)"
+      "Bash(PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -m uvicorn app:app --port 8030 --host 127.0.0.1)",
+      "Bash(cd d:/ && ls -d */ 2>/dev/null | head -30; echo \"---\"; find /d -maxdepth 4 -iname \"*evascular*\" 2>/dev/null | head -20)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m pytest test_illustration_regions.py -q)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe test_image_regen.py)",
+      "Bash(sed -n '/An Oblong Picture/,/^$/p')",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe test_split_spreads.py)",
+      "Bash(python -c \"import ast,sys; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in ['image_localizer.py','image_regen.py']]; print\\('ok'\\)\")"
     ]
   }
 }

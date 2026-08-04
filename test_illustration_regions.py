@@ -63,7 +63,10 @@ from image_regions import (
     TextFreePages,
     _illustration_clusters,
     _is_backdrop,
+    _is_furniture_ink,
     _is_image_mask,
+    _is_mark_shaped,
+    _outlined_text_lines,
     _rasterize_rect,
 )
 from pdf_processor import FONTS_DIR, _panels, _rules, _vector_marks
@@ -785,6 +788,37 @@ def test_regeneration_mode():
         f"{SIMPLE_MODE_MAX_PIXELS} does not sit between the two",
     )
 
+    # "reimagine" frees the frame, so everything that has to line up with the original
+    # afterwards has to be absent before it is offered.
+    free = dict(has_baked_text=False, information_role="decorative", contains_logo=False)
+    check(
+        "A textless decorative picture is redrawn as a Bangladeshi scene, not retouched",
+        _regeneration_mode(plenty, *big, **free) == "reimagine",
+        _regeneration_mode(plenty, *big, **free),
+    )
+    for name, override in (
+        ("its words are painted back at the original's coordinates", {"has_baked_text": True}),
+        ("the picture IS a datum the page states", {"information_role": "referential"}),
+        ("a mark inside it is protected by position", {"contains_logo": True}),
+    ):
+        got = _regeneration_mode(plenty, *big, **{**free, **override})
+        check(f"…but not when {name}", got == "context", got)
+    check(
+        "A textless icon is still too small to recompose",
+        _regeneration_mode(plenty, *small, **free) == "simple",
+        _regeneration_mode(plenty, *small, **free),
+    )
+    check(
+        "…and so is a textless picture with no brief to redraw from",
+        _regeneration_mode("two words", *big, **free) == "simple",
+        _regeneration_mode("two words", *big, **free),
+    )
+    check(
+        "Defaults are the cautious reading — a caller that names nothing gets the in-place edit",
+        _regeneration_mode(plenty, *big) == "context",
+        _regeneration_mode(plenty, *big),
+    )
+
 
 def test_cover_detection():
     """A cover is a picture with a title on it; a body page and a plain title page are not."""
@@ -1497,6 +1531,9 @@ def test_divider_cartoons_are_found_in_a_translated_manual():
     check("…and dedups to a single signature, so the book gets one consistent redraw",
           len({r.content_key for r in found.values()}) == 1,
           f"{len({r.content_key for r in found.values()})} signatures")
+    check("…and is redrawn, not just relabelled — its lettering is one t-shirt slogan",
+          all(r.redraw_safe for r in found.values()),
+          f"{sum(1 for r in found.values() if not r.redraw_safe)} refused a redraw")
     if 13 in found:
         rect = found[13].rect
         check("…framed on the artwork rather than the whole page",
@@ -1505,11 +1542,126 @@ def test_divider_cartoons_are_found_in_a_translated_manual():
 
     # The other direction, which is what the old page-level limit was protecting: a cluster
     # with the page's words running through it is a table or a diagram, not a picture.
-    for page_num in (16, 75, 87, 89, 90):
+    for page_num in (75, 87, 89, 90):
         check(f"Page {page_num}'s table/diagram line art is still refused",
               not regions_on(doc, page_num),
               f"detected {len(regions_on(doc, page_num))} region(s)")
     doc.close()
+
+
+def test_a_panel_of_drawn_words_is_translated_but_not_redrawn():
+    """Tier 1: page 16's "Exercise can:" panel — words translated, artwork left alone.
+
+    The panel shipped in English. Its ten bullets are drawn as vector outlines rather than
+    set in a font, so the text pipeline had nothing to translate, and the region detector —
+    which would have handed them to the image pipeline — refused it: seven letters of the
+    "Exercise can:" heading measure ~7x7pt each, which is exactly what `_vector_marks` calls
+    a checkbox, and a checkbox inside a cluster vetoes it. Only the two words the layout did
+    set in a font, "type II diabetes" and "cancers", came out in Bangla.
+
+    Both halves are asserted here, because passing only the first is worse than failing:
+    with the veto gone the classifier calls the panel "decorative" (it is full of smiley
+    faces) and the edit model would redraw ten lines of clinical advice as a picture.
+    """
+    print("\n=== A Panel Of Drawn Words ===")
+    if not os.path.exists(REVASC_PDF):
+        print(f"  SKIP  {REVASC_PDF} not found")
+        skipped.append("panel_of_drawn_words")
+        return
+
+    doc = fitz.open(REVASC_PDF)
+    regions = regions_on(doc, 16)
+    check("The exercise panel is detected, so its drawn English is translated",
+          len(regions) == 1, f"detected {len(regions)} region(s)")
+    if regions:
+        region = regions[0]
+        check("…and never regenerated, because it is a panel of words",
+              not region.redraw_safe)
+        check("…framed on the panel and its heading, not the spread",
+              region.rect.get_area() / doc[15].rect.get_area() < 0.15,
+              f"covers {region.rect.get_area() / doc[15].rect.get_area():.0%} of the page")
+        check("…and reaching the heading whose letters used to veto it",
+              region.rect.y0 < 120, f"top edge at {region.rect.y0:.0f}")
+    doc.close()
+
+
+def test_a_letter_is_not_a_checkbox():
+    """Tier 1: the size-and-shape checkbox test, applied to ink instead of a bounding box.
+
+    `_vector_marks` reads width, height and aspect, which a 7pt letter drawn as outlines
+    satisfies as well as a tick box does. What separates them is the ink: a box is one "re"
+    or four straight lines, a letter is dozens of curve segments.
+    """
+    print("\n=== A Letter Is Not A Checkbox ===")
+    box_re = {"type": "s", "rect": fitz.Rect(0, 0, 9, 9), "items": [("re", None)]}
+    box_lines = {"type": "s", "rect": fitz.Rect(0, 0, 9, 9),
+                 "items": [("l", None, None)] * 4}
+    letter = {"type": "f", "rect": fitz.Rect(0, 0, 7, 7), "items": [("c", None)] * 36}
+    circle = {"type": "f", "rect": fitz.Rect(0, 0, 18, 18), "items": [("c", None)] * 4}
+
+    check("A rectangle drawn as one 're' is furniture", _is_furniture_ink(box_re))
+    check("…and so is one drawn as four straight lines", _is_furniture_ink(box_lines))
+    check("A letter outline is not", not _is_furniture_ink(letter))
+    check("Nor is a circle, whose corners are not square", not _is_furniture_ink(circle))
+    check("A tick box is mark-shaped", _is_mark_shaped(fitz.Rect(0, 0, 9, 9)))
+    check("A rule is not", not _is_mark_shaped(fitz.Rect(0, 0, 90, 2)))
+
+    # Rows of glyphs are what make a cluster a panel rather than a picture. Three abreast
+    # is a line; two shapes on a baseline are a cartoon's eyes.
+    line = [dict(letter, rect=fitz.Rect(x, 0, x + 7, 7)) for x in range(0, 70, 10)]
+    eyes = [dict(letter, rect=fitz.Rect(x, 0, x + 7, 7)) for x in (0, 20)]
+    check("Seven letters on a baseline are a line of text",
+          _outlined_text_lines(line) == 1, f"{_outlined_text_lines(line)} lines")
+    check("Two shapes on a baseline are not",
+          _outlined_text_lines(eyes) == 0, f"{_outlined_text_lines(eyes)} lines")
+    check("Neither are plain boxes, however many",
+          _outlined_text_lines([box_re] * 8) == 0,
+          f"{_outlined_text_lines([box_re] * 8)} lines")
+
+
+def test_ocr_boxes_arrive_in_the_models_own_convention():
+    """Tier 1: box_2d ([y0,x0,y1,x1] on a 0-1000 grid) becomes [x0,y0,x1,y1] fractions.
+
+    Asked for fractions of width and height, the model was unreliable on anything oblong:
+    on the exercise panel it found ten lines of twelve and put them a line and a half low,
+    and two runs of the identical request at temperature 0 disagreed. Asked in the
+    convention it was trained on it found all twelve, twice, identically. The order swap is
+    the whole risk of the change — a y read as an x puts every Bangla block on the diagonal
+    — so it is pinned here.
+    """
+    print("\n=== OCR Boxes In The Model's Own Convention ===")
+    import image_localizer
+
+    class _Response:
+        text = json.dumps({"blocks": [
+            {"text": "Help...", "lang": "en", "box_2d": [208, 30, 264, 150]},
+            {"text": "tall and thin", "lang": "en", "box_2d": [0, 0, 1000, 40]},
+            {"text": "out of range", "lang": "en", "box_2d": [-50, 900, 1200, 1100]},
+            {"text": "inside out", "lang": "en", "box_2d": [800, 900, 200, 100]},
+            {"text": "", "lang": "en", "box_2d": [0, 0, 100, 100]},
+            {"text": "short box", "lang": "en", "box_2d": [10, 20, 30]},
+        ]})
+
+    original = image_localizer.generate_content
+    image_localizer.generate_content = lambda **kw: _Response()
+    try:
+        blocks = image_localizer._extract_text_blocks(b"x", "image/png")
+    finally:
+        image_localizer.generate_content = original
+
+    by_text = {b["text"]: b["bbox"] for b in blocks}
+    check("y and x are read in the order the model sends them",
+          by_text.get("Help...") == [0.03, 0.208, 0.15, 0.264],
+          f"{by_text.get('Help...')}")
+    check("…so a tall narrow box stays tall and narrow",
+          by_text.get("tall and thin") == [0.0, 0.0, 0.04, 1.0],
+          f"{by_text.get('tall and thin')}")
+    check("A box running off the image is clamped to it",
+          by_text.get("out of range") == [0.9, 0.0, 1.0, 1.0],
+          f"{by_text.get('out of range')}")
+    check("An inside-out box is dropped", "inside out" not in by_text)
+    check("…and so is a block with no text", "" not in by_text)
+    check("…and one whose box is the wrong length", "short box" not in by_text)
 
 
 def test_unreadable_text_is_never_blanked():
@@ -1641,6 +1793,9 @@ if __name__ == "__main__":
     test_a_picture_containing_a_mark_is_not_a_mark()
     test_nothing_the_overlay_draws_overlaps()
     test_divider_cartoons_are_found_in_a_translated_manual()
+    test_a_panel_of_drawn_words_is_translated_but_not_redrawn()
+    test_a_letter_is_not_a_checkbox()
+    test_ocr_boxes_arrive_in_the_models_own_convention()
     test_unreadable_text_is_never_blanked()
     test_audit_is_written_to_disk()
 

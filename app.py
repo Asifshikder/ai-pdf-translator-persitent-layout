@@ -3,9 +3,10 @@
 import logging
 import os
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 
+import page_fix
 from extract_images import extract_images
 from fix_processor import FIX_SUFFIX, fix_pdf
 from image_localizer_pipeline import localize_single_image
@@ -13,6 +14,7 @@ from image_processor import localize_pdf
 from image_regen import REGEN_SUFFIX, regenerate_pdf
 from manifest import ManifestMissing, ManifestUnsupported
 from pdf_processor import translate_pdf
+from split_spreads import SPLIT_SUFFIX, split_spreads
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,6 +58,14 @@ async def translate(file: UploadFile = File(...)):
     except Exception:
         logger.exception("Translation pipeline failed")
         raise HTTPException(status_code=500, detail="Translation failed. Check the server logs.")
+
+    # Print-ready sources are often laid out two-up: one A3 sheet carrying two
+    # facing A4 pages. Translation reproduces the geometry it is given, so the
+    # spreads have to come apart afterwards.
+    try:
+        translated, _ = split_spreads(translated)
+    except Exception:
+        logger.exception("Spread splitting failed — returning the unsplit translation")
 
     return _pdf_response(file, translated, "_bn.pdf")
 
@@ -115,6 +125,26 @@ async def fix(file: UploadFile = File(...)):
     )
 
 
+@app.post("/split")
+async def split(file: UploadFile = File(...)):
+    pdf_bytes = await _read_pdf(file)
+    try:
+        split_bytes, summary = split_spreads(pdf_bytes)
+    except Exception:
+        logger.exception("Spread splitting failed")
+        raise HTTPException(
+            status_code=500, detail="Splitting failed. Check the server logs."
+        )
+
+    # Expose-Headers: fetch() cannot read a custom header unless it is listed.
+    return _pdf_response(
+        file,
+        split_bytes,
+        SPLIT_SUFFIX,
+        {"X-Split-Summary": summary, "Access-Control-Expose-Headers": "X-Split-Summary"},
+    )
+
+
 @app.post("/extract_images")
 async def extract_images_endpoint(file: UploadFile = File(...)):
     pdf_bytes = await _read_pdf(file)
@@ -148,3 +178,99 @@ async def localize_images_endpoint(file: UploadFile = File(...)):
     out_name += ext
     headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
     return Response(content=localized_bytes, media_type=file.content_type or "image/jpeg", headers=headers)
+
+
+# --------------------------------------------------------------------------------------
+# Page Fix — its own window, its own session-based pipeline (page_fix.py).
+#
+# Unlike every endpoint above, this one is a conversation rather than a single
+# request/response: the user uploads once, then issues instructions page by page and
+# watches the result, so the document lives in a server-side session until they download
+# it. Nothing here touches the pipelines above.
+# --------------------------------------------------------------------------------------
+
+
+@app.get("/pagefix")
+def pagefix_window():
+    return FileResponse(os.path.join(BASE_DIR, "static", "pagefix.html"))
+
+
+@app.post("/pagefix/upload")
+async def pagefix_upload(file: UploadFile = File(...)):
+    pdf_bytes = await _read_pdf(file)
+    try:
+        session = page_fix.create_session(os.path.basename(file.filename or ""), pdf_bytes)
+    except page_fix.PageFixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception("Page fix: could not open the upload")
+        raise HTTPException(status_code=500, detail="Could not open that PDF.")
+
+    return JSONResponse(
+        {"session": session.sid, "filename": session.filename, "pages": session.page_count}
+    )
+
+
+@app.get("/pagefix/{sid}/page/{page_number}")
+def pagefix_page(sid: str, page_number: int, dpi: int = page_fix.PREVIEW_DPI):
+    try:
+        session = page_fix.get_session(sid)
+        png = page_fix.render_page(
+            session.pdf, page_number - 1, dpi=max(40, min(300, dpi))
+        )
+    except page_fix.PageFixError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        logger.exception("Page fix: rendering page %d failed", page_number)
+        raise HTTPException(status_code=500, detail="Could not render that page.")
+
+    # no-store: the same URL returns different pixels after every edit.
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.post("/pagefix/{sid}/fix")
+async def pagefix_fix(
+    sid: str,
+    instruction: str = Form(...),
+    images: list[UploadFile] = File(default=[]),
+):
+    attachments = []
+    for upload in images or []:
+        raw = await upload.read()
+        if raw:
+            attachments.append((os.path.basename(upload.filename or "image"), raw))
+
+    try:
+        report = page_fix.fix_document(sid, instruction, attachments)
+    except page_fix.PageFixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception("Page fix pipeline failed")
+        raise HTTPException(status_code=500, detail="The fix failed. Check the server logs.")
+
+    return JSONResponse(report)
+
+
+@app.post("/pagefix/{sid}/undo")
+def pagefix_undo(sid: str):
+    try:
+        undone = page_fix.undo(sid)
+    except page_fix.PageFixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse({"undone": undone})
+
+
+@app.get("/pagefix/{sid}/download")
+def pagefix_download(sid: str):
+    try:
+        session = page_fix.get_session(sid)
+    except page_fix.PageFixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    out_name = os.path.splitext(session.filename)[0] + page_fix.PAGEFIX_SUFFIX
+    return Response(
+        content=session.pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )

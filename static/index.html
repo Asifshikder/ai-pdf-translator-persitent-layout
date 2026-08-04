@@ -38,6 +38,13 @@
     background: #2f6fed; color: #fff; font-weight: 600;
   }
 
+  .sidebar-link {
+    display: block; margin-top: .75rem; padding: .7rem .9rem; border-radius: 8px;
+    font-size: .95rem; color: inherit; text-decoration: none;
+    border: 1px dashed rgba(127,127,127,.45); transition: all .15s;
+  }
+  .sidebar-link:hover { background: rgba(47,111,237,.1); border-color: #2f6fed; }
+
   .main {
     flex: 1; display: flex; align-items: center; justify-content: center;
     padding: 2rem;
@@ -95,8 +102,13 @@
     <button class="sidebar-option" data-mode="localize">Localize PDF Images</button>
     <button class="sidebar-option" data-mode="regenerate">Regenerate PDF Images</button>
     <button class="sidebar-option" data-mode="fix">Fix PDF</button>
+    <button class="sidebar-option" data-mode="split">Split Spread Pages</button>
     <button class="sidebar-option" data-mode="extract_images">Extract Images</button>
     <button class="sidebar-option" data-mode="localize_images">Localize Images</button>
+    <!-- Its own window: Page Fix is a session, not a one-shot upload, so it cannot be a
+         mode of the form above. Plain link, and a class of its own, so none of the mode
+         JS applies to it. -->
+    <a class="sidebar-link" href="/pagefix">Fix a Page (AI) ↗</a>
   </div>
 
   <div class="main">
@@ -153,6 +165,12 @@ const MODES = {
     endpoint: '/fix', label: 'Fix Bangla PDF', suffix: '_fix.pdf',
     busy: 'Fixing… re-checking every page for missed translations and overlapping text.',
     hint: 'Upload a translated _bn.pdf. Text that was never translated is translated again, and text overlapping its neighbour is re-fitted. Pages with no problems are left untouched.',
+    acceptType: 'application/pdf,.pdf',
+  },
+  split: {
+    endpoint: '/split', label: 'Split Spread Pages', suffix: '_split.pdf',
+    busy: 'Splitting… checking each page for a two-up spread.',
+    hint: 'Print layouts often put two facing pages on one wide sheet. Each such sheet is cut down the gutter into two pages. Pages with content crossing the middle are left alone. Translate already does this — use it for PDFs made before.',
     acceptType: 'application/pdf,.pdf',
   },
   extract_images: {
@@ -287,7 +305,8 @@ async function uploadFile() {
       try { msg = (await res.json()).detail || msg; } catch {}
       throw new Error(msg);
     }
-    const summary = res.headers.get('X-Fix-Summary') || res.headers.get('X-Regen-Summary');
+    const summary = res.headers.get('X-Fix-Summary') || res.headers.get('X-Regen-Summary')
+      || res.headers.get('X-Split-Summary');
     const blob = await res.blob();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);

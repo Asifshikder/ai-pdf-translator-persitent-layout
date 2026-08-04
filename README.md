@@ -42,6 +42,42 @@ Pages with no defects are left byte-identical, and the run costs no API calls if
 is nothing to fix. A PDF without a manifest is rejected with a 400 — re-run Translate
 first. Re-running Fix on its own output is a no-op.
 
+## Fix a PDF by asking (Page Fix)
+
+The Fix tab above repairs defects this tool can recognise on its own. **Fix a PDF with AI**
+(`page_fix.py`, its own window at <http://127.0.0.1:8000/pagefix>) handles the rest: drop
+in a PDF, type what is wrong with it, attach any images it needs, and click **Fix it**.
+
+You do not say which page — describe what you can see and it finds it:
+
+- *"The subtitle that says 'Not just a book' should say 'More than a book'"* — the wording
+  is replaced in the original size, colour and weight, growing into the free space beside
+  it rather than shrinking;
+- *"Replace the cartoon of the woman at the computer with the attached photo"* — the
+  attachment is placed in exactly that spot;
+- *"Remove the empty grey box under the table on page 6"* — naming a page works too (and
+  a page's *printed* folio is reconciled with its position in the file); the region is
+  cleared to the colour of the page around it;
+- *"Make the person in this illustration Bangladeshi"* — that region alone is handed to an
+  image model and redrawn back into the same rectangle.
+
+Instructions stack: each one applies on top of the last, **Undo** takes back the whole of
+the previous instruction however many pages it touched, and **Download PDF** gives you
+`<name>_pagefix.pdf`. Every changed page is shown back to you with a list of what was done
+to it.
+
+Two model calls per instruction, for a reason. Locating the page needs only a thumbnail
+and a text digest of each page; planning the edit needs a full-resolution render and the
+page's measured geometry, which would be ruinous to send for all forty pages of a manual.
+The planner then answers with a short list of typed operations (erase / replace_text /
+insert_text / insert_image / regenerate_image / draw_box) which are applied as ordinary
+PyMuPDF calls on a rectangle — it never produces a page. So a misunderstood instruction
+can produce a wrong edit, but never a corrupt page. If it cannot find what you mean, it
+changes nothing and says so rather than guessing.
+
+Sessions live in the server's memory (six hours, eight documents), so download the result
+before restarting uvicorn.
+
 ## Notes
 
 - Credentials: `vertextaiproject2.json` (service account key) in the project root.
@@ -62,6 +98,14 @@ first. Re-running Fix on its own output is a no-op.
 ```powershell
 .\.venv\Scripts\python.exe test_layout.py
 ```
+
+```powershell
+.\.venv\Scripts\python.exe test_page_fix.py
+```
+
+`test_page_fix.py` covers the Page Fix pipeline with the planner stubbed, so it makes no
+API calls either: the coordinate convention, the redaction-then-draw ordering, style
+inheritance, session/undo, and the rule under a heading surviving a replacement above it.
 
 `test_layout.py` runs the segmentation and box-planning stages against real PDFs and
 makes **no API calls**, so it is free and fast. It covers the defects that keep coming
