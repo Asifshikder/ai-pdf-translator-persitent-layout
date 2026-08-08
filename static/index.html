@@ -101,6 +101,7 @@
     <button class="sidebar-option active" data-mode="translate">Translate PDF</button>
     <button class="sidebar-option" data-mode="localize">Localize PDF Images</button>
     <button class="sidebar-option" data-mode="regenerate">Regenerate PDF Images</button>
+    <button class="sidebar-option" data-mode="redesign">Redesign PDF (AI)</button>
     <button class="sidebar-option" data-mode="fix">Fix PDF</button>
     <button class="sidebar-option" data-mode="split">Split Spread Pages</button>
     <button class="sidebar-option" data-mode="extract_images">Extract Images</button>
@@ -159,6 +160,12 @@ const MODES = {
     endpoint: '/regenerate', label: 'Regenerate Images', suffix: '_regen.pdf',
     busy: 'Regenerating images… each one is checked, redrawn and put back in place.',
     hint: 'Every image is redrawn for a Bangladeshi audience and swapped back into its exact position. Text inside an image is translated; logos, medical figures and the page\'s own text are left untouched.',
+    acceptType: 'application/pdf,.pdf',
+  },
+  redesign: {
+    endpoint: '/redesign', label: 'Redesign PDF (AI)', suffix: '_redesigned.pdf',
+    busy: 'Redesigning… this can take a while as every page is re-planned and rebuilt.',
+    hint: 'Every page is rebuilt from scratch onto a consistent set of layouts: text is translated, images are culturally adapted for Bangladesh, and logos are kept untouched. Page count and page numbers stay the same as the original.',
     acceptType: 'application/pdf,.pdf',
   },
   fix: {
@@ -313,9 +320,35 @@ async function uploadFile() {
     a.download = file.name.replace(/\.pdf$/i, '') + cfg.suffix;
     a.click();
     URL.revokeObjectURL(a.href);
-    status.textContent = summary
-      ? 'Done — ' + summary
-      : 'Done — your download should start automatically.';
+
+    let docxOk = null;
+    if (mode === 'translate') {
+      try {
+        const docxForm = new FormData();
+        docxForm.append('file', blob, a.download);
+        const docxRes = await fetch('/export_docx', { method: 'POST', body: docxForm });
+        if (!docxRes.ok) throw new Error();
+        const docxBlob = await docxRes.blob();
+        const da = document.createElement('a');
+        da.href = URL.createObjectURL(docxBlob);
+        da.download = file.name.replace(/\.pdf$/i, '') + '_bn.docx';
+        da.click();
+        URL.revokeObjectURL(da.href);
+        docxOk = true;
+      } catch {
+        docxOk = false;
+      }
+    }
+
+    if (docxOk === true) {
+      status.textContent = 'Done — PDF and DOCX downloaded.';
+    } else if (docxOk === false) {
+      status.textContent = 'Done — PDF downloaded; DOCX export failed.';
+    } else {
+      status.textContent = summary
+        ? 'Done — ' + summary
+        : 'Done — your download should start automatically.';
+    }
   } catch (err) {
     status.textContent = err.message;
     status.className = 'error';

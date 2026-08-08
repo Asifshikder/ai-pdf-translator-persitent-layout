@@ -6,13 +6,18 @@ import os
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+import fitz
+
+import manifest
 import page_fix
+from docx_export import build_docx
 from extract_images import extract_images
 from fix_processor import FIX_SUFFIX, fix_pdf
 from image_localizer_pipeline import localize_single_image
 from image_processor import localize_pdf
 from image_regen import REGEN_SUFFIX, regenerate_pdf
 from manifest import ManifestMissing, ManifestUnsupported
+from page_redesign import redesign_pdf
 from pdf_processor import translate_pdf
 from split_spreads import SPLIT_SUFFIX, split_spreads
 
@@ -70,6 +75,37 @@ async def translate(file: UploadFile = File(...)):
     return _pdf_response(file, translated, "_bn.pdf")
 
 
+@app.post("/export_docx")
+async def export_docx(file: UploadFile = File(...)):
+    """Build a DOCX from a translated PDF's embedded manifest.
+
+    Re-extracts nothing: the manifest already carries every segment's Bangla
+    text and styling, so this is cheap and needs no AI calls.
+    """
+    pdf_bytes = await _read_pdf(file)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        data = manifest.read(doc)
+    except (ManifestMissing, ManifestUnsupported) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        doc.close()
+
+    try:
+        docx_bytes = build_docx(data)
+    except Exception:
+        logger.exception("DOCX export failed")
+        raise HTTPException(status_code=500, detail="DOCX export failed. Check the server logs.")
+
+    out_name = os.path.splitext(os.path.basename(file.filename))[0] + ".docx"
+    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=headers,
+    )
+
+
 @app.post("/localize")
 async def localize(file: UploadFile = File(...)):
     pdf_bytes = await _read_pdf(file)
@@ -123,6 +159,18 @@ async def fix(file: UploadFile = File(...)):
         FIX_SUFFIX,
         {"X-Fix-Summary": summary, "Access-Control-Expose-Headers": "X-Fix-Summary"},
     )
+
+
+@app.post("/redesign")
+async def redesign(file: UploadFile = File(...)):
+    pdf_bytes = await _read_pdf(file)
+    try:
+        redesigned = redesign_pdf(pdf_bytes)
+    except Exception:
+        logger.exception("Page redesign pipeline failed")
+        raise HTTPException(status_code=500, detail="Page redesign failed. Check the server logs.")
+
+    return _pdf_response(file, redesigned, "_redesigned.pdf")
 
 
 @app.post("/split")

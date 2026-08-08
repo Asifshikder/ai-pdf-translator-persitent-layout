@@ -151,3 +151,59 @@ def read(doc: fitz.Document) -> dict:
             f"version {SCHEMA_VERSION}. Re-run Translate to Bangla on the original PDF."
         )
     return data
+
+
+# --------------------------------------------------------------------------------------
+# Redesign manifest — audit trail for page_redesign.py's full-page AI relayout pipeline.
+#
+# Kept as its own embedded file rather than folded into the translate/fix manifest above:
+# the two pipelines record different things (a template choice and slot/image decisions,
+# not a segment's growable insert_rect), and a redesigned page's manifest must never be
+# mistaken for a fixable one by fix_processor.py, which assumes SCHEMA_VERSION's shape.
+# --------------------------------------------------------------------------------------
+
+REDESIGN_MANIFEST_FILE = "redesign_manifest.json"
+REDESIGN_SCHEMA_VERSION = 1
+
+
+def redesign_page_entry(
+    page_num: int,
+    template_id: str,
+    page_role: str,
+    text_assignments: list[dict],
+    image_decisions: list[dict],
+) -> dict:
+    """One redesigned page: which template it used and what went into each slot."""
+    return {
+        "page": page_num,
+        "template": template_id,
+        "role": page_role,
+        "text": text_assignments,
+        "images": image_decisions,
+    }
+
+
+def redesign_build(style_profile: dict, source_fonts: set[str], pages: list[dict]) -> dict:
+    return {
+        "v": REDESIGN_SCHEMA_VERSION,
+        "tool": "pdftranslator-redesign",
+        "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "style_profile": style_profile,
+        "source_fonts": sorted(source_fonts),
+        "pages": pages,
+    }
+
+
+def redesign_attach(doc: fitz.Document, data: dict) -> None:
+    """Embed the redesign manifest, replacing any previous one."""
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    try:
+        doc.embfile_del(REDESIGN_MANIFEST_FILE)
+    except Exception:
+        pass  # no previous manifest
+    doc.embfile_add(
+        REDESIGN_MANIFEST_FILE,
+        payload,
+        filename=REDESIGN_MANIFEST_FILE,
+        desc="pdftranslator page-redesign manifest",
+    )

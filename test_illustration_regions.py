@@ -29,10 +29,18 @@ from PIL import Image, ImageDraw
 
 from image_processor import (
     CONTEXT_MIN_WORDS,
+    LOCK_MAX_AREA_SHARE,
+    LOCK_MAX_INK,
+    LOCK_MERGE_PAD_PT,
+    LOCK_SOURCE_MAX_INK,
     MAX_RESIDUAL_INK,
     MIN_OVERLAY_HEIGHT,
     SIMPLE_MODE_MAX_PIXELS,
     SNAP_MAX_AREA_GROWTH,
+    STYLE_FLAT_MAX_COLORS,
+    STYLE_FLAT_MAX_SOFT,
+    STYLE_PHOTO_MIN_COLORS,
+    STYLE_PHOTO_MIN_SOFT,
     _anchor_box,
     _apply_cover,
     _block_key,
@@ -40,14 +48,22 @@ from image_processor import (
     _plate_color,
     _text_only_result,
     _write_audit,
+    _derive_smask,
     _detect_cover_page,
     _downscale_for_model,
+    _flat_locks,
     _is_english_block,
+    _locked_rects,
+    _locked_rects_for_xref,
+    _locked_share,
+    _lock_summary,
+    _locks_kept,
     _match_background,
     _outside_logos,
     _overlay_text_blocks,
     _background_color,
     _page_ink_coverage,
+    _restamp_locks,
     _restamp_logos,
     _palette_summary,
     _prepare_text_only_image,
@@ -55,6 +71,9 @@ from image_processor import (
     _regeneration_mode,
     _series_xrefs,
     _snap_to_ink,
+    _style_class,
+    _style_metrics,
+    _style_summary,
     _swap_image_in_place,
     _text_rects_in,
     _to_png,
@@ -483,7 +502,7 @@ def test_palette_and_background_match():
     summary5 = _palette_summary(page5)
     check(
         "A white-field illustration reports its flat background",
-        "background is flat #ffffff" in summary5,
+        "background is EXACTLY #ffffff" in summary5,
         f"got: {summary5}",
     )
 
@@ -742,6 +761,433 @@ def test_erased_blocks_are_identifiable():
         "…while carrying the snapped box it will actually be drawn into",
         overlay and overlay[0]["bbox"] != overlay[0]["source_bbox"],
         "the box was not snapped at all",
+    )
+
+
+def _flat_drawing(size: int = 400) -> Image.Image:
+    """A hard-edged illustration: solid fills, no shading. ImageDraw does not anti-alias,
+    so every boundary is an exact step — which is what a screen print's edges are."""
+    img = Image.new("RGB", (size, size), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((40, 40, 200, 240), fill=(30, 30, 30))
+    draw.ellipse((180, 120, 360, 320), fill=(200, 60, 40))
+    draw.rectangle((60, 280, 340, 360), fill=(60, 140, 90))
+    return img
+
+
+def test_style_is_measured_not_asserted():
+    """How a picture is DRAWN is measured, the way its palette is — "keep the style" alone
+    comes back soft-shaded with glow, which is what "it feels generated" means."""
+    print("\n=== Drawing Style ===")
+
+    flat = _flat_drawing()
+    check(
+        "Solid fills with hard boundaries read as a flat illustration",
+        _style_class(_style_metrics(_png(flat))) == "flat",
+        str(_style_metrics(_png(flat))),
+    )
+    check(
+        "…and the sentence says so in the original's own numbers",
+        "FLAT, HARD-EDGED" in _style_summary(_png(flat))
+        and "PHOTOGRAPH" not in _style_summary(_png(flat)),
+        _style_summary(_png(flat))[:120],
+    )
+
+    # The same shapes under a vertical luminance ramp. Note the ramp moves only ~0.3 levels
+    # per pixel: shading is detected as "neighbours differ at all", never by the SIZE of the
+    # difference, because a gradient is smooth by definition. See STYLE_SOFT_BAND.
+    shaded = flat.copy()
+    pixels = shaded.load()
+    for y in range(shaded.height):
+        k = 0.55 + 0.45 * (y / shaded.height)
+        for x in range(shaded.width):
+            r, g, b = pixels[x, y]
+            pixels[x, y] = (int(r * k), int(g * k), int(b * k))
+    check(
+        "The same drawing under a wash reads as shaded, not flat",
+        _style_class(_style_metrics(_png(shaded))) == "shaded",
+        str(_style_metrics(_png(shaded))),
+    )
+
+    # A smooth 2-D field. Do NOT build this as `(x * 4) % 256` — that is a sawtooth wrapping
+    # every 64px, whose wrap edges measure as hard steps, and it classifies as FLAT.
+    photo = Image.new("RGB", (400, 400))
+    photo.putdata(
+        [
+            ((x * 255) // 400, (y * 255) // 400, ((x + y) * 255) // 800)
+            for y in range(400)
+            for x in range(400)
+        ]
+    )
+    check(
+        "Continuous tone reads as a photograph",
+        _style_class(_style_metrics(_png(photo))) == "photograph",
+        str(_style_metrics(_png(photo))),
+    )
+
+    check(
+        "A blank field is flat, not shaded — nothing drawn means nothing shaded",
+        _style_class(_style_metrics(_png(Image.new("RGB", (200, 200), (255, 255, 255))))) == "flat",
+    )
+    check(
+        "Bytes that are not an image report nothing rather than guessing",
+        _style_summary(b"not a png") == "" and _style_metrics(b"not a png") is None,
+    )
+    check(
+        "The flat and photograph bands cannot silently overlap",
+        STYLE_FLAT_MAX_COLORS < STYLE_PHOTO_MIN_COLORS
+        and STYLE_FLAT_MAX_SOFT < STYLE_PHOTO_MIN_SOFT,
+        f"{STYLE_FLAT_MAX_COLORS}/{STYLE_PHOTO_MIN_COLORS}, "
+        f"{STYLE_FLAT_MAX_SOFT}/{STYLE_PHOTO_MIN_SOFT}",
+    )
+
+
+def _page_with_a_captioned_placard() -> fitz.Document:
+    """One page: a figure's placard (a blank grey rectangle) with a live text line on it,
+    a second line 2pt below it, another line 30pt away, and a line outside the picture."""
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=400)
+    page.draw_rect(fitz.Rect(100, 60, 300, 160), color=(0.8, 0.8, 0.8), fill=(0.8, 0.8, 0.8))
+    page.insert_text((110, 90), "first caption line", fontsize=9)
+    page.insert_text((110, 101), "second caption line", fontsize=9)
+    page.insert_text((110, 150), "a separate line further down", fontsize=9)
+    page.insert_text((20, 380), "page text nowhere near the picture", fontsize=9)
+    return doc
+
+
+def test_live_text_pins_a_surface():
+    """The page's own printed text cannot move, so whatever it sits on is reserved."""
+    print("\n=== Locked Surfaces ===")
+    doc = _page_with_a_captioned_placard()
+    page = doc[0]
+    rect = fitz.Rect(80, 40, 320, 200)  # the picture, as an illustration region would be
+
+    locked = _locked_rects(rect, _text_rects_in(page, rect))
+    check("A caption over a picture reserves the surface it is printed on", bool(locked), "no locks")
+    check(
+        "…and only what is inside the picture — the page's other text is not its problem",
+        all(0.0 <= v <= 1.0 for box in locked for v in box) and len(locked) <= 3,
+        str(locked),
+    )
+    check(
+        "Two lines 2pt apart are one caption, not two rectangles",
+        len(locked) == 2,
+        f"{len(locked)} rect(s): {locked}",
+    )
+    top = min(locked, key=lambda b: b[1])
+    check(
+        "…and that one rectangle spans both of its lines",
+        (top[3] - top[1]) * rect.height > 12,
+        f"height {(top[3] - top[1]) * rect.height:.1f}pt",
+    )
+    check(
+        "A line 30pt away stays its own rectangle",
+        LOCK_MERGE_PAD_PT < 30,
+        f"merge pad is {LOCK_MERGE_PAD_PT}",
+    )
+    check(
+        "A picture with no text over it reserves nothing",
+        _locked_rects(fitz.Rect(20, 250, 200, 340), _text_rects_in(page, fitz.Rect(20, 250, 200, 340)))
+        == [],
+    )
+    check("Nothing locked is nothing covered", _locked_share([]) == 0.0)
+    check(
+        "Overlapping locks are counted once, not twice",
+        abs(_locked_share([(0.0, 0.0, 0.5, 0.5), (0.25, 0.25, 0.5, 0.5)]) - 0.25) < 1e-6,
+        str(_locked_share([(0.0, 0.0, 0.5, 0.5), (0.25, 0.25, 0.5, 0.5)])),
+    )
+    doc.close()
+
+
+def test_a_raster_locks_every_page_it_is_printed_on():
+    """One XObject, rewritten once, placed on many pages — so its locks are the union."""
+    print("\n=== Locks Across Placements ===")
+    doc = fitz.open()
+    art = _png(Image.new("RGB", (200, 200), (240, 240, 240)))
+    for caption_y in (60, 300):
+        page = doc.new_page(width=400, height=400)
+        page.insert_image(fitz.Rect(50, 50, 350, 350), stream=art)
+        page.insert_text((80, caption_y), "a caption printed over the picture", fontsize=9)
+
+    xref = doc[0].get_images(full=True)[0][0]
+    one_page, _ = _locked_rects_for_xref(doc, xref, [1])
+    both, mappable = _locked_rects_for_xref(doc, xref, [1, 2])
+    check("A caption on page 1 reserves its surface", len(one_page) == 1, str(one_page))
+    check(
+        "…and a different caption on page 2 reserves a second one, on the same xref",
+        len(both) == 2,
+        f"{len(both)}: {both}",
+    )
+    check("Upright placements are mappable", mappable)
+    check(
+        "Skipping a page drops its locks",
+        _locked_rects_for_xref(doc, xref, [1, 2], skip_page=2)[0] == one_page,
+    )
+    doc.close()
+
+
+def test_a_moved_placard_is_caught_in_pixels():
+    """The prompt asks for the reserved rectangle back; only a measurement guarantees it."""
+    print("\n=== Locks Are Verified, Not Trusted ===")
+    lock = [(0.25, 0.20, 0.75, 0.45)]
+
+    def scene(placard_at, field=(250, 250, 250), placard=(215, 215, 215)):
+        img = Image.new("RGB", (200, 200), field)
+        ImageDraw.Draw(img).rectangle(placard_at, fill=placard)
+        return _png(img)
+
+    source = scene((50, 40, 150, 90))
+    kept = scene((50, 40, 150, 90))
+    check("An untouched reserved rectangle passes", _locks_kept(kept, source, lock) == [])
+
+    moved = scene((50, 80, 150, 130))  # the placard slid 40px down, out from under the text
+    check(
+        "A placard that moved out from under its caption is caught",
+        _locks_kept(moved, source, lock) == [0],
+        str(_locks_kept(moved, source, lock)),
+    )
+
+    drawn_on = scene((50, 40, 150, 90))
+    img = Image.open(io.BytesIO(drawn_on)).convert("RGB")
+    ImageDraw.Draw(img).rectangle((60, 45, 140, 85), fill=(20, 20, 20))
+    check(
+        "…and so is one the model drew an arm across",
+        _locks_kept(_png(img), source, lock) == [0],
+    )
+
+    repaired, which = _restamp_locks(moved, source, lock, [0])
+    check("A lost rectangle is repaired from the source's own blank pixels", which == [0])
+    check(
+        "…and the repaired picture passes the same check",
+        _locks_kept(repaired, source, lock) == [],
+        str(_locks_kept(repaired, source, lock)),
+    )
+
+    # The model put a genuinely different field there. Pasting the old colour into it would
+    # be a visible patch, so the repair declines and the regeneration is discarded instead.
+    recoloured = scene((50, 80, 150, 130), field=(40, 90, 160), placard=(30, 70, 130))
+    _, none_repaired = _restamp_locks(recoloured, source, lock, [0])
+    check("A repair that would show is refused", none_repaired == [], str(none_repaired))
+    check(
+        "…leaving the lock failed, which is what discards the regeneration",
+        _locks_kept(recoloured, source, lock) == [0],
+    )
+
+
+def test_a_pinned_picture_does_not_get_a_free_redraw():
+    """Locks buy freedom for the rest of the frame — until they cover too much of it."""
+    print("\n=== Pinned Is Not Locked ===")
+    import image_localizer as loc
+    plenty = " ".join(["word"] * (CONTEXT_MIN_WORDS + 4))
+    free = dict(has_baked_text=False, information_role="decorative", contains_logo=False)
+
+    got = _regeneration_mode(plenty, 900, 900, **free, locked_share=0.10)
+    check("A small reserved area still allows a free redraw", got == "reimagine", got)
+    got = _regeneration_mode(plenty, 900, 900, **free, locked_share=0.40)
+    check("…a large one does not — that picture is pinned, not locked", got == "context", got)
+    check(
+        "The threshold sits between the two",
+        0.10 <= LOCK_MAX_AREA_SHARE < 0.40,
+        f"{LOCK_MAX_AREA_SHARE}",
+    )
+    got = _regeneration_mode(plenty, 900, 900, **free, lock_unmappable=True)
+    check("A rotated placement cannot be locked, so it is not freed", got == "context", got)
+
+    # Which rectangles are worth reserving. Both halves of this were wrong on the first run and
+    # the failure was visible on the page: a white card painted into a man's jumper, while the
+    # placard it was supposed to protect went unreserved.
+    # The real picture: a man in a jumper holding a white placard, on a white field.
+    art = Image.new("RGB", (400, 400), (255, 255, 255))
+    drawing = ImageDraw.Draw(art)
+    # Big enough that the `face` box AND the band sampled around it both land inside it — a
+    # smaller one lets the ring catch the paper outside and the box reads as "distinct".
+    drawing.ellipse((140, 20, 300, 180), fill=(200, 150, 110))            # a face
+    drawing.rectangle((40, 180, 360, 380), fill=(120, 120, 120))          # a jumper
+    drawing.rectangle((80, 200, 320, 300), fill=(252, 252, 252), outline=(20, 20, 20), width=4)
+
+    # The caption's own box, padded out to the surface — which is how a real one arrives, and
+    # means it clips the placard's dark outline and a little jumper. That is exactly what the
+    # first version of this filter rejected.
+    placard = (0.19, 0.49, 0.81, 0.76)
+    jumper = (0.62, 0.85, 0.80, 0.95)    # a page footer overlapping the artwork
+    face = (0.45, 0.15, 0.62, 0.32)      # text laid straight over the subject
+    record: dict = {}
+    kept = _flat_locks(_png(art), [placard, jumper, face], record)
+
+    check(
+        "A caption's box is reserved even though it clips the placard's own outline",
+        placard in kept,
+        f"kept {kept}",
+    )
+    check(
+        "A patch of jumper is NOT reserved — same colour inside and out, so nothing can fall "
+        "off, and reserving it makes the model paint a card into the artwork",
+        jumper not in kept,
+        f"kept {kept}",
+    )
+    check("Text laid over a face is not a surface either", face not in kept, f"kept {kept}")
+    check("…and the audit counts what was dropped", record.get("locks_unenforceable") == 2, str(record))
+
+    check(
+        "The source test is looser than the result test — a border in the box is not artwork",
+        LOCK_SOURCE_MAX_INK > LOCK_MAX_INK,
+        f"{LOCK_SOURCE_MAX_INK} vs {LOCK_MAX_INK}",
+    )
+    check(
+        "A reserved area is never described as something blank to draw",
+        "blank" not in (
+            loc.LOCK_CLAUSE_HEAD + loc.LOCK_ITEM + loc.LOCK_CLAUSE_COMPACT + loc.LOCK_ITEM_COMPACT
+        ).lower(),
+        "the word 'blank' is back in the lock clause — it makes the model draw a card",
+    )
+    check(
+        "…and it says outright not to add one",
+        "do not add a card" in loc.LOCK_CLAUSE_HEAD.lower(),
+    )
+
+
+def test_every_prompt_still_formats():
+    """A stray {slot} raises KeyError inside a worker and surfaces as a generic edit_failed,
+    which reads as a model problem for a long time. So it is checked here instead."""
+    print("\n=== Prompts Format ===")
+    import image_localizer as loc
+
+    seen = []
+    original = loc._run_edit_models
+    loc._run_edit_models = lambda instruction, *a, **k: seen.append(instruction)
+    try:
+        for mode in loc.LOCALIZE_MODES:
+            for style, locks in (("measured style.", "RESERVED: one rect."), ("", "")):
+                loc.localize_image(
+                    b"", "image/png", ["people_attire"], " ".join(["word"] * 12),
+                    "#ffffff (90%)", mode=mode, style=style, locks=locks,
+                )
+        for style in ("measured style.", ""):
+            loc.localize_cover(b"", "image/png", "some page words here", "#fff", style)
+    finally:
+        loc._run_edit_models = original
+
+    check(
+        f"All {len(seen)} prompt variants format with no slot left behind",
+        all("{" not in text for text in seen),
+        next((t[t.index("{"):][:60] for t in seen if "{" in t), ""),
+    )
+    check("Every mode produced a prompt", len(seen) == len(loc.LOCALIZE_MODES) * 2 + 2)
+
+
+def test_the_prompts_name_the_props_that_must_go():
+    """The gloves survived because three rules named skin, hair and clothing and none named
+    a glove. Naming the props is the whole mechanism — see BANGLADESHI_VOCABULARY."""
+    print("\n=== Prompts Name The Props ===")
+    import image_localizer as loc
+
+    vocab = loc.BANGLADESHI_VOCABULARY.lower()
+    for prop in ("glove", "hi-vis", "helmet", "boots", "knife and fork"):
+        check(f"The vocabulary names {prop!r} as something that does not survive", prop in vocab)
+    check(
+        "…and it reaches the prompts that carry it",
+        all(
+            "{vocabulary}" in t
+            for t in (loc.EDIT_INSTRUCTION, loc.REIMAGINE_INSTRUCTION, loc.COVER_INSTRUCTION)
+        ),
+    )
+    check(
+        "The compact prompt names them inline instead, since it carries no vocabulary block",
+        "glove" in loc.SIMPLE_EDIT_INSTRUCTION.lower()
+        and "{vocabulary}" not in loc.SIMPLE_EDIT_INSTRUCTION,
+    )
+    check(
+        "Only the redraw licenses a new pose",
+        "POSED DIFFERENTLY" in loc.REIMAGINE_INSTRUCTION
+        and "POSED DIFFERENTLY" not in loc.EDIT_INSTRUCTION,
+    )
+    check(
+        "The redraw holds a plain field rather than filling it with a scene",
+        "A PLAIN BACKGROUND IS NOT A SCENE TO FILL IN" in loc.REIMAGINE_INSTRUCTION,
+    )
+
+
+def test_a_redrawn_figure_leaves_no_ghost_of_the_old_one():
+    """A cut-out picture carries a soft mask shaped like the figure that was in it.
+
+    Inheriting it across a redraw does two visible things: it clips the new figure to the old
+    one's outline, and wherever the old silhouette is opaque but the new picture has only its
+    own background there, the page shows a pale patch shaped like the figure that used to be
+    there. On a white page that is invisible; over a coloured panel it is the ghost the user
+    reported. So the mask is rebuilt from the new pixels.
+    """
+    print("\n=== No Ghost Of The Old Figure ===")
+
+    def cut_out(draw_figure) -> bytes:
+        img = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+        draw_figure(ImageDraw.Draw(img))
+        return _png(img)
+
+    # The old picture: a tall figure on the left. The new one: a wider figure on the right,
+    # which is what a free redraw does.
+    old = cut_out(lambda d: d.ellipse((20, 20, 90, 180), fill=(230, 60, 50, 255)))
+    new_rgb = Image.new("RGB", (200, 200), (255, 255, 255))
+    ImageDraw.Draw(new_rgb).ellipse((110, 40, 190, 160), fill=(60, 120, 200))
+    new = _png(new_rgb)
+
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=200)
+    page.draw_rect(page.rect, color=(0.6, 0.4, 0.7), fill=(0.6, 0.4, 0.7))  # a coloured panel
+    page.insert_image(page.rect, stream=old)
+    doc = fitz.open(stream=doc.tobytes(), filetype="pdf")
+    page = doc[0]
+    xref = page.get_images(full=True)[0][0]
+    check("The fixture really is a cut-out with a soft mask", page.get_images(full=True)[0][1] != 0)
+
+    alpha = _derive_smask(new)
+    check("A picture on a flat field can describe its own silhouette", alpha is not None)
+
+    # A picture that bleeds to its edges has no background to measure against and no cut-out
+    # to preserve, so the derivation declines and the inherited mask stands.
+    bleed = Image.new("RGB", (120, 120))
+    bleed.putdata(
+        [((x * 255) // 120, (y * 255) // 120, 128) for y in range(120) for x in range(120)]
+    )
+    check("A full-bleed picture declines to describe a silhouette", _derive_smask(_png(bleed)) is None)
+
+    _swap_image_in_place(doc, xref, new)
+    rendered = Image.open(io.BytesIO(page.get_pixmap(dpi=72).tobytes("png"))).convert("RGB")
+
+    def panel_at(x, y):
+        """True if the page's own purple shows here — i.e. the picture is transparent."""
+        return max(abs(a - b) for a, b in zip(rendered.getpixel((x, y)), (153, 102, 178))) < 40
+
+    check(
+        "The new figure is not clipped to where the old one stood",
+        not panel_at(150, 100),
+        f"new figure's centre renders as {rendered.getpixel((150, 100))}",
+    )
+    check(
+        "…and no pale patch is left in the old figure's shape",
+        panel_at(55, 100),
+        f"the old figure's centre renders as {rendered.getpixel((55, 100))}",
+    )
+    check("The panel around both is untouched", panel_at(5, 5) and panel_at(195, 195))
+    doc.close()
+
+    # An enclosed area the same colour as the background is part of the figure, not a hole:
+    # a white shirt on a white field must not let the panel show through.
+    shirt = Image.new("RGB", (120, 120), (255, 255, 255))
+    drawing = ImageDraw.Draw(shirt)
+    drawing.ellipse((20, 20, 100, 100), fill=(20, 20, 20))
+    drawing.ellipse((40, 40, 80, 80), fill=(255, 255, 255))  # the shirt, background-coloured
+    mask = _derive_smask(_png(shirt))
+    check("A white shirt on a white field is derived opaque", mask is not None)
+    if mask:
+        got = Image.frombytes("L", (120, 120), mask)
+        check("…so the panel behind it cannot show through", got.getpixel((60, 60)) == 255,
+              f"alpha at the shirt is {got.getpixel((60, 60))}")
+        check("…while the field around the figure stays transparent",
+              got.getpixel((5, 5)) == 0, f"alpha at the corner is {got.getpixel((5, 5))}")
+
+    check(
+        "A picture with no background to measure keeps whatever mask it had",
+        _derive_smask(b"not a png") is None,
     )
 
 
@@ -1774,6 +2220,14 @@ if __name__ == "__main__":
     test_erase_box_snaps_to_the_ink()
     test_erased_blocks_are_identifiable()
     test_regeneration_mode()
+    test_style_is_measured_not_asserted()
+    test_live_text_pins_a_surface()
+    test_a_raster_locks_every_page_it_is_printed_on()
+    test_a_moved_placard_is_caught_in_pixels()
+    test_a_pinned_picture_does_not_get_a_free_redraw()
+    test_every_prompt_still_formats()
+    test_the_prompts_name_the_props_that_must_go()
+    test_a_redrawn_figure_leaves_no_ghost_of_the_old_one()
     test_cover_detection()
     test_apply_cover()
     test_background_match_leaves_a_picture_alone()

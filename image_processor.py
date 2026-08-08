@@ -22,6 +22,10 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageChops, ImageDraw, ImageStat
 
 from image_localizer import (
+    LOCK_CLAUSE_COMPACT,
+    LOCK_CLAUSE_HEAD,
+    LOCK_ITEM,
+    LOCK_ITEM_COMPACT,
     classify_image,
     detect_logo_regions,
     localize_cover,
@@ -183,6 +187,51 @@ SIMPLE_MODE_MAX_PIXELS = 120_000
 # Turn it off to go back to the pinned-frame edit everywhere. What that costs is visible in
 # the audit: `regeneration_mode` says which prompt each picture got.
 REIMAGINE_TEXTLESS_PICTURES = True
+
+# ---------------------------------------------------------------------------------------
+# Locked surfaces
+# ---------------------------------------------------------------------------------------
+# The parts of a picture that the page's OWN printed text sits over.
+#
+# Pictures are rendered from a text-free shadow page, so a caption printed onto a placard is
+# invisible to the OCR that decides `has_baked_text` — the picture reads as textless and the
+# frame looks free, while in fact a line of Bangla is pinned over it at page coordinates that
+# cannot move. Freeing such a frame strands the caption in mid-air, and `_punch_text_holes`
+# makes that worse rather than better: it tests the SOURCE for flatness, so it still knocks a
+# hole and the text shows through onto the backdrop with no placard under it.
+#
+# A lock says the one true thing about those rectangles — "come back here, this size, blank" —
+# instead of the much stronger and mostly false thing the pinned-frame prompt says, which is
+# "nothing in this picture moves". Everything else stays free, which is the point.
+LOCK_LIVE_TEXT_SURFACES = True
+LOCK_PAD_PT = 2.0  # grown around a live text line; _punch_text_holes uses 1.0 for a hole
+LOCK_MERGE_PAD_PT = 3.0  # lines this close are one caption and get one rectangle
+LOCK_MIN_SIDE = 0.015  # of the picture; a sliver is not a surface worth reserving
+LOCK_MAX_RECTS = 6  # more than this is a page of prose sitting on a picture
+# Above this share the picture is pinned rather than locked, and an honest constrained edit
+# beats a "free" redraw that has to reproduce a quarter of the frame exactly.
+LOCK_MAX_AREA_SHARE = 0.25
+LOCK_MAX_INK = 0.03  # of a locked rect allowed to be non-background afterwards
+# ...and how much of it may be off its own dominant colour in the SOURCE and still count as a
+# surface. Far looser than the check on the result: a caption's box padded out to the surface
+# usually clips the placard's own outline, and demanding uniformity there rejects every real
+# placard. See _flat_locks.
+LOCK_SOURCE_MAX_INK = 0.25
+# How different a surface must be from what surrounds it before it is worth reserving. A
+# placard against a photograph clears this easily; a patch of jumper a page footer happens to
+# overlap does not, and must not be locked — see _flat_locks.
+LOCK_DISTINCT_MIN = 30
+LOCK_RING_SHARE = 0.25  # width of the band sampled outside a rect, as a share of its short side
+LOCK_RING_MIN_PX = 4
+LOCK_BG_TOLERANCE = 40  # per-channel colour drift still counted as the same surface
+LOCK_SURFACE_MARGIN = 0.90  # the clean surface must cover this much of the locked rect
+LOCK_NEIGHBOURHOOD = 8  # px sampled around a rect to decide whether a repair would show
+# Deliberately zero. One picture already costs up to EDIT_ATTEMPTS_PER_MODEL x
+# (EDIT_QUOTA_RETRY_PASSES + 1) requests and ~140s of sleeps, and the image quota is
+# per-MINUTE per-project and shared by every image model — a lock-failure re-edit does not cost
+# one picture, it steals the minute from the whole document. A failed lock is repaired from the
+# source's own pixels for free, or the regeneration is discarded.
+LOCK_REEDIT_PASSES = 0
 
 # ---------------------------------------------------------------------------------------
 # Cover
@@ -360,6 +409,157 @@ def _palette_summary(png_bytes: bytes, max_colors: int = 6) -> str:
             f"or replace the background — it must come back the same colour it went in."
         )
     return summary
+
+
+# How the picture is DRAWN, measured. The sibling of _palette_summary, and there for the same
+# reason: a prompt that says "keep exactly that style" is an adjective, and the model returns
+# its house style anyway — a flat hard-edged screen-print comes back soft-shaded, with glow and
+# gradients, and reads as generated. Naming the measurement holds it, the way naming the hex
+# values holds the palette.
+STYLE_SAMPLE = 192  # px: the square the style is measured on
+STYLE_COVER = 0.90  # share of the picture the counted colour bins must cover
+STYLE_POSTERIZE_MASK = 0xE0  # top 3 bits per channel -> 512 fixed bins
+STYLE_EDGE_MIN = 32  # gradient magnitude at which a pixel counts as an edge at all
+# ...and at which that edge is a step rather than a ramp. Set so a 2px anti-aliased black-on-
+# white edge (a 255 step spread over 2px, ~128/px) still reads as hard: vector regions are
+# rendered through get_pixmap, which anti-aliases everything.
+STYLE_HARD_EDGE = 96
+# Shading is measured as "moving, but not an edge" — any non-zero difference below
+# STYLE_EDGE_MIN. Measuring its MAGNITUDE instead does not work and the failure is not
+# obvious: a gradient is smooth by definition, so a 45%-over-400px ramp moves ~0.3 levels
+# per pixel, which any magnitude band wide enough to exclude noise also excludes. What
+# actually separates a solid fill from a wash is that the fill's neighbours are EXACTLY
+# equal, and the wash's differ by one level nearly everywhere.
+STYLE_SOFT_BAND = (1, STYLE_EDGE_MIN)
+# Below this share of edge pixels the picture has no detail to judge — a blank or near-blank
+# field. Nothing is drawn, so nothing is shaded: hard_share is read as 1.0 rather than as the
+# 0/0 it literally is, which would otherwise report a plain white rectangle as "shaded".
+STYLE_MIN_EDGES = 0.002
+STYLE_FLAT_MAX_COLORS = 12
+STYLE_FLAT_MIN_HARD = 0.55  # of the EDGE pixels, not of every pixel
+STYLE_FLAT_MAX_SOFT = 0.15
+STYLE_PHOTO_MIN_COLORS = 60
+STYLE_PHOTO_MIN_SOFT = 0.45
+
+_STYLE_FLAT = (
+    "The original's drawing style, measured: {n} flat colours cover {cover:.0%} of it, "
+    "{hard:.0%} of its edges are hard steps and only {soft:.0%} of it is any kind of gradient "
+    "— it is a FLAT, HARD-EDGED illustration, drawn the way a screen print is drawn. Redraw it "
+    "that way and no other: solid areas of unshaded colour, crisp closed outlines of even "
+    "weight, and hard boundaries between colours. No soft shading, no gradients, no blur, no "
+    "glow or bloom, no drop shadows, no glossy highlights, no airbrushed or painterly texture, "
+    "no ambient occlusion, no photographic lighting, no depth-of-field. It must look printed, "
+    "not generated."
+)
+_STYLE_SHADED = (
+    "The original's drawing style, measured: {n} colours cover {cover:.0%} of it, {hard:.0%} of "
+    "its edges are hard and {soft:.0%} of it is continuous gradient — it is a SHADED "
+    "illustration. Keep exactly that much shading and no more. Do not flatten it into clip art, "
+    "and do not push it towards a photograph or a 3D render."
+)
+_STYLE_PHOTO = (
+    "The original's drawing style, measured: {n} distinct colours cover {cover:.0%} of it and "
+    "{soft:.0%} of it is continuous tone — it is a PHOTOGRAPH. Return a photograph with the "
+    "same lens, depth of field and lighting. Do not return an illustration, a cartoon, a "
+    "painting or a 3D render."
+)
+
+
+def _style_metrics(png_bytes: bytes) -> dict | None:
+    """Measure how a picture is drawn: colour count, hard-edge share, gradient share.
+
+    Read the FULL-RES bytes, never `_downscale_for_model`'s copy — that resize is LANCZOS,
+    which softens exactly the edges being counted and would report every line drawing as
+    shaded.
+
+    Returns None when the image cannot be read.
+    """
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as raw:
+            # NEAREST, not BOX or LANCZOS: averaging blurs hard edges into ramps and invents
+            # intermediate colours, which is the measurement inverted. Subsampling keeps both
+            # the histogram's shape and the edge steps.
+            small = raw.convert("RGB").resize((STYLE_SAMPLE, STYLE_SAMPLE), Image.NEAREST)
+
+        # Fixed buckets, NOT convert("P", palette=ADAPTIVE): adaptive quantization always
+        # fills its palette, so a four-colour graphic and a photograph both come back with
+        # exactly `colors` entries and the count says nothing.
+        binned = small.point(lambda v: v & STYLE_POSTERIZE_MASK)
+        counts = sorted(binned.getcolors(maxcolors=512 * 4) or [], reverse=True)
+        total = sum(n for n, _ in counts) or 1
+        seen, flat_colors = 0, 0
+        for n, _rgb in counts:
+            seen += n
+            flat_colors += 1
+            if seen / total >= STYLE_COVER:
+                break
+
+        grey = small.convert("L")
+        dx = ImageChops.difference(grey, ImageChops.offset(grey, 1, 0))
+        dy = ImageChops.difference(grey, ImageChops.offset(grey, 0, 1))
+        # The crop is mandatory: ImageChops.offset WRAPS, so the last row and column compare
+        # the image against its opposite edge and are pure noise.
+        edges = ImageChops.lighter(dx, dy).crop(
+            (0, 0, STYLE_SAMPLE - 1, STYLE_SAMPLE - 1)
+        )
+        histogram = edges.histogram()
+    except Exception:
+        logger.debug("Could not measure the source's drawing style", exc_info=True)
+        return None
+
+    pixels = sum(histogram) or 1
+    edge_px = sum(histogram[STYLE_EDGE_MIN + 1:])
+    hard_px = sum(histogram[STYLE_HARD_EDGE + 1:])
+    soft_px = sum(histogram[STYLE_SOFT_BAND[0]:STYLE_SOFT_BAND[1] + 1])
+    edge_share = edge_px / pixels
+    return {
+        "flat_colors": flat_colors,
+        "cover": min(seen / total, 1.0),
+        "edge_share": edge_share,
+        # Of the EDGES, how many are steps rather than ramps — a photograph has plenty of
+        # edges, but they arrive through a gradient. A picture with essentially no edges has
+        # nothing shaded in it either; see STYLE_MIN_EDGES.
+        "hard_share": (hard_px / edge_px) if edge_share >= STYLE_MIN_EDGES else 1.0,
+        "soft_share": soft_px / pixels,
+    }
+
+
+def _style_class(metrics: dict) -> str:
+    """"flat", "shaded" or "photograph" from _style_metrics' numbers."""
+    if (
+        metrics["flat_colors"] <= STYLE_FLAT_MAX_COLORS
+        and metrics["soft_share"] <= STYLE_FLAT_MAX_SOFT
+        and metrics["hard_share"] >= STYLE_FLAT_MIN_HARD
+    ):
+        return "flat"
+    if (
+        metrics["flat_colors"] >= STYLE_PHOTO_MIN_COLORS
+        or metrics["soft_share"] >= STYLE_PHOTO_MIN_SOFT
+    ):
+        return "photograph"
+    return "shaded"
+
+
+def _style_summary(png_bytes: bytes) -> str:
+    """Describe the source's drawing technique for the edit model, as a measured sentence.
+
+    Returns "" when the image can't be read, in which case the prompt falls back to its
+    qualitative instruction — same contract as _palette_summary.
+    """
+    metrics = _style_metrics(png_bytes)
+    if metrics is None:
+        return ""
+    template = {
+        "flat": _STYLE_FLAT,
+        "shaded": _STYLE_SHADED,
+        "photograph": _STYLE_PHOTO,
+    }[_style_class(metrics)]
+    return template.format(
+        n=metrics["flat_colors"],
+        cover=metrics["cover"],
+        hard=metrics["hard_share"],
+        soft=metrics["soft_share"],
+    )
 
 
 # Above this share of the image, what the border sampled is not a background — see
@@ -776,7 +976,10 @@ def _localize_cover_render(
     """
     model_png = _downscale_for_model(png_bytes)
     start = time.time()
-    new_cover = localize_cover(model_png, "image/png", context, _palette_summary(model_png))
+    # Style measured on the full-res render, not model_png — see _style_metrics.
+    new_cover = localize_cover(
+        model_png, "image/png", context, _palette_summary(model_png), _style_summary(png_bytes)
+    )
     record["edit_time_sec"] = round(time.time() - start, 2)
     if not new_cover:
         logger.warning("Cover regeneration failed — keeping the original cover")
@@ -838,6 +1041,23 @@ def _png_size(png_bytes: bytes) -> tuple[int, int]:
 COVER_TEXT_BG_TOLERANCE = 90
 
 
+def _backdrop_color(img: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int]:
+    """The colour behind a line of text: the median over its own box.
+
+    The median rather than the centre pixel, because the centre pixel is as likely to land on
+    a glyph as on the paper behind it — and comparing glyph to glyph reports no change however
+    far the background has moved. Lettering is a minority of its own box, so the median is the
+    backdrop.
+
+    Shared by _cover_keeps_text_backgrounds and the locked-rect check, which ask the same
+    question of a page and of a picture.
+    """
+    crop = img.crop(box)
+    crop.thumbnail((24, 24))
+    data = list(crop.getdata())
+    return tuple(round(statistics.median(c[i] for c in data)) for i in range(3))  # type: ignore[return-value]
+
+
 def _cover_keeps_text_backgrounds(new_cover: bytes, page: fitz.Page) -> bool:
     """True if the regenerated cover still has the right colour behind the page's own text.
 
@@ -858,19 +1078,6 @@ def _cover_keeps_text_backgrounds(new_cover: bytes, page: fitz.Page) -> bool:
         scale_x = before.width / max(page.rect.width, 1)
         scale_y = before.height / max(page.rect.height, 1)
 
-        def backdrop(img: Image.Image, box: tuple[int, int, int, int]):
-            """The colour behind a line of text: the median over its own box.
-
-            The median rather than the centre pixel, because the centre pixel is as likely
-            to land on a glyph as on the paper behind it — and comparing glyph to glyph
-            reports no change however far the background has moved. Lettering is a minority
-            of its own box, so the median is the backdrop.
-            """
-            crop = img.crop(box)
-            crop.thumbnail((24, 24))
-            data = list(crop.getdata())
-            return tuple(statistics.median(c[i] for c in data) for i in range(3))
-
         moved = 0
         checked = 0
         for block in page.get_text("dict")["blocks"]:
@@ -886,7 +1093,7 @@ def _cover_keeps_text_backgrounds(new_cover: bytes, page: fitz.Page) -> bool:
                 if box[2] - box[0] < 2 or box[3] - box[1] < 2:
                     continue
                 checked += 1
-                was, now = backdrop(before, box), backdrop(after, box)
+                was, now = _backdrop_color(before, box), _backdrop_color(after, box)
                 if max(abs(a - b) for a, b in zip(was, now)) > COVER_TEXT_BG_TOLERANCE:
                     moved += 1
         if checked and moved / checked > 0.25:
@@ -989,7 +1196,144 @@ def _resize_to(image_bytes: bytes, original_width: int, original_height: int) ->
         return image_bytes
 
 
-def _swap_image_in_place(doc: fitz.Document, xref: int, png_bytes: bytes) -> bool:
+# A regenerated picture's soft mask is DERIVED from the picture rather than inherited.
+#
+# `_swap_image_in_place` keeps the original /SMask, which is what stops a cut-out figure
+# becoming an opaque rectangle printed over the page's panels. Its own comment records the
+# price: "the old silhouette also clips the new picture, so a redrawn figure whose outline
+# moved can lose an edge." That was a fair trade when every edit was pinned in place. It stops
+# being one in "reimagine" mode, where the outline is MEANT to move: the old mask then clips
+# the new figure to the old one's shape, and — worse — wherever the old silhouette is opaque
+# and the new picture has only its own background there, the page shows a pale patch in the
+# shape of the figure that used to be there. That is the "shadow of the previous image".
+#
+# So the mask is rebuilt from the new pixels: opaque where the picture is not its own
+# background. Every step below is guarded, and any guard failing keeps the original mask —
+# the inherited-mask behaviour is the fallback, never the thing being replaced blindly.
+REDERIVE_SMASK = True
+SMASK_BG_TOLERANCE = 16  # per-channel distance from the background still counted as background
+SMASK_ALPHA_HIGH = 56  # ...and the distance at which a pixel is fully opaque; between the two
+# the alpha ramps, so edges stay as soft as the artwork's own anti-aliasing.
+SMASK_MIN_OPAQUE = 0.02  # below this the derived mask would erase the picture
+SMASK_MAX_OPAQUE = 0.97  # above it there is no cut-out to preserve, so the old mask is no worse
+
+
+def _derive_smask(png_bytes: bytes) -> bytes | None:
+    """An 8-bit soft mask for a regenerated picture, or None to keep the original.
+
+    Opaque where the picture is not its own background colour. Two details carry the weight:
+
+      - Enclosed background is kept OPAQUE. A white shirt on a white field is background by
+        colour and figure by intent, and a mask built on colour alone punches a hole through
+        it that the page's panel shows through. So transparency is only granted to background
+        that can be reached from outside: the image is padded with a ring of background and
+        flood-filled from the corner, which connects every background region touching the
+        border and no enclosed one.
+      - The edge ramps rather than cutting, so the silhouette keeps the artwork's own
+        anti-aliasing instead of gaining a hard staircase.
+
+    None whenever the derivation cannot be trusted — no flat background to measure against, or
+    a result so nearly all-opaque or all-transparent that it is not describing a cut-out.
+    """
+    if not REDERIVE_SMASK:
+        return None
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as raw:
+            img = raw.convert("RGB")
+        background = _background_color(img)
+        if background is None:
+            return None  # a full-bleed picture has no cut-out to describe
+
+        # Per-channel max distance from the background, as one greyscale plane.
+        difference = ImageChops.difference(img, Image.new("RGB", img.size, background))
+        red, green, blue = difference.split()
+        distance = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+
+        # Mark the background that is reachable from outside the picture. The 1px pad is what
+        # makes one flood fill enough: it joins every border-touching background region, while
+        # a hole enclosed by the figure stays unreachable.
+        looks_like_background = distance.point(
+            lambda v: 255 if v <= SMASK_BG_TOLERANCE else 0
+        )
+        padded = Image.new("L", (img.width + 2, img.height + 2), 255)
+        padded.paste(looks_like_background, (1, 1))
+        ImageDraw.floodfill(padded, (0, 0), 128)
+        outside = padded.crop((1, 1, img.width + 1, img.height + 1)).point(
+            lambda v: 255 if v == 128 else 0
+        )
+
+        span = max(SMASK_ALPHA_HIGH - SMASK_BG_TOLERANCE, 1)
+        alpha = distance.point(
+            lambda v: 0
+            if v <= SMASK_BG_TOLERANCE
+            else (255 if v >= SMASK_ALPHA_HIGH else round(255 * (v - SMASK_BG_TOLERANCE) / span))
+        )
+        # Everything not reachable from outside is part of the figure, whatever its colour.
+        alpha.paste(255, (0, 0) + img.size, ImageChops.invert(outside).convert("1"))
+
+        opaque = sum(i * n for i, n in enumerate(alpha.histogram())) / (255 * alpha.width * alpha.height)
+        if not SMASK_MIN_OPAQUE <= opaque <= SMASK_MAX_OPAQUE:
+            logger.debug(
+                "Derived soft mask is %.0f%% opaque — outside [%.0f%%, %.0f%%], keeping the "
+                "original", opaque * 100, SMASK_MIN_OPAQUE * 100, SMASK_MAX_OPAQUE * 100,
+            )
+            return None
+        return alpha.tobytes()
+    except Exception:
+        logger.debug("Could not derive a soft mask for the regenerated image", exc_info=True)
+        return None
+
+
+def _rewrite_smask(
+    doc: fitz.Document, xref: int, png_bytes: bytes, notes: dict | None = None
+) -> bool:
+    """Replace the image's soft mask with one derived from its new pixels. True if replaced.
+
+    A no-op for an image that has no /SMask, which is most of them.
+
+    `notes` is the caller's audit record, written into rather than returned: whether a picture
+    had a mask at all, and whether it kept an inherited one, is the difference between two
+    failures that look identical on the page.
+    """
+    try:
+        key, value = doc.xref_get_key(xref, "SMask")
+        has_mask = key == "xref"
+        if notes is not None:
+            notes["had_smask"] = has_mask
+        if not has_mask:
+            return False
+        smask_xref = int(value.split()[0])
+    except Exception:
+        logger.debug("xref %d: could not read /SMask", xref, exc_info=True)
+        return False
+
+    alpha = _derive_smask(png_bytes)
+    if alpha is None:
+        return False
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as raw:
+            width, height = raw.size
+        doc.update_stream(smask_xref, alpha, new=True, compress=True)
+        doc.xref_set_key(smask_xref, "Width", str(width))
+        doc.xref_set_key(smask_xref, "Height", str(height))
+        doc.xref_set_key(smask_xref, "ColorSpace", "/DeviceGray")
+        doc.xref_set_key(smask_xref, "BitsPerComponent", "8")
+        doc.xref_set_key(smask_xref, "Filter", "/FlateDecode")
+        # As on the base image: keys that described the stream that used to be here.
+        for stale in ("DecodeParms", "Decode", "ImageMask", "Interpolate", "SMask", "Mask"):
+            doc.xref_set_key(smask_xref, stale, "null")
+        return True
+    except Exception:
+        logger.exception(
+            "xref %d: could not rewrite soft mask %d — keeping the original mask",
+            xref, smask_xref,
+        )
+        return False
+
+
+def _swap_image_in_place(
+    doc: fitz.Document, xref: int, png_bytes: bytes, notes: dict | None = None
+) -> bool:
     """Rewrite an image XObject's pixels, leaving the page content stream untouched.
 
     This is what keeps the replacement visible. A page's layout routinely draws an
@@ -1029,19 +1373,33 @@ def _swap_image_in_place(doc: fitz.Document, xref: int, png_bytes: bytes) -> boo
         # Keys inherited from the old stream that no longer describe this one. /ImageMask and
         # /Decode must go or a former 1-bit stencil keeps being painted as a stencil.
         #
-        # /SMask is deliberately NOT cleared. A soft mask is scaled to the base image by the
-        # viewer (PDF 32000-1, 8.9.6.4), so the original one still fits — and it is what keeps
-        # a cut-out figure a cut-out. Dropping it turns the picture into an opaque rectangle
+        # /SMask is never cleared. A soft mask is scaled to the base image by the viewer
+        # (PDF 32000-1, 8.9.6.4), so an inherited one still fits — and it is what keeps a
+        # cut-out figure a cut-out. Dropping it turns the picture into an opaque rectangle
         # that covers whatever panel it was floating over, which reads as overlap on the page.
-        # The trade is that the old silhouette also clips the new picture, so a redrawn figure
-        # whose outline moved can lose an edge. An occasional clipped elbow is the cheaper
-        # failure than a white box printed over the layout.
         #
-        # It matters more here than in image_regen: _stored_out_of_rgb makes this pipeline
-        # *render* a CMYK image from its placement, so the replacement already contains the
-        # page background — nulling the SMask then prints that background over the layout.
+        # It is REPLACED rather than inherited where the new pixels can describe their own
+        # silhouette (see _derive_smask). Inheriting it clips the new figure to the old one's
+        # outline and leaves the new picture's background showing in the shape of the figure
+        # that used to be there — the ghost. Where the derivation is not trustworthy the old
+        # mask stays, which is the behaviour this had before.
+        #
+        # Either way it must not be nulled: _stored_out_of_rgb makes this pipeline *render* a
+        # CMYK image from its placement, so the replacement already contains the page
+        # background, and an unmasked one prints that background back over the layout.
         for key in ("DecodeParms", "Decode", "Mask", "ImageMask", "Interpolate"):
             doc.xref_set_key(xref, key, "null")
+        rebuilt = _rewrite_smask(doc, xref, png_bytes, notes)
+        if notes is not None:
+            notes["smask_rebuilt"] = rebuilt
+        if rebuilt:
+            logger.info("xref %d: soft mask rebuilt from the regenerated picture", xref)
+        elif notes is not None and notes.get("had_smask"):
+            logger.info(
+                "xref %d: kept its original soft mask — the new picture could not describe "
+                "its own silhouette, so it stays clipped to the old one's outline",
+                xref,
+            )
         return True
     except Exception:
         logger.exception("xref %d: in-place image swap failed — keeping the original", xref)
@@ -1144,6 +1502,380 @@ def _text_rects_in(page: fitz.Page, rect: fitz.Rect) -> list[fitz.Rect]:
             if not (line_rect & rect).is_empty:
                 found.append(line_rect)
     return found
+
+
+# A locked rectangle, as fractions of the picture: (x0, y0, x1, y1). Same convention as an
+# OCR block's bbox and a logo region's, so _restamp_logos' box mapping transfers unchanged.
+LockedRect = tuple[float, float, float, float]
+
+
+def _merge_rects(rects: list[fitz.Rect], pad: float) -> list[fitz.Rect]:
+    """Group rectangles that come within `pad` of each other and return each group's bbox.
+
+    Its own union-find rather than image_regions._union_find_merge, whose CLUSTER_PAD of 12pt
+    is tuned for gluing vector drawing fragments into an illustration. At that distance a
+    heading two lines above a caption joins the caption's rectangle, and the lock grows to
+    cover artwork that was never printed on.
+    """
+    if not rects:
+        return []
+    parent = list(range(len(rects)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    grown = [fitz.Rect(r) + (-pad, -pad, pad, pad) for r in rects]
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            if not (grown[i] & grown[j]).is_empty:
+                parent[find(i)] = find(j)
+
+    groups: dict[int, fitz.Rect] = {}
+    for i, rect in enumerate(rects):
+        root = find(i)
+        groups[root] = fitz.Rect(rect) if root not in groups else groups[root] | rect
+    return list(groups.values())
+
+
+def _normalize_rect(rect: fitz.Rect, within: fitz.Rect) -> LockedRect | None:
+    """`rect` clipped to `within` and expressed as fractions of it, or None if it misses."""
+    clipped = fitz.Rect(rect) & within
+    if clipped.is_empty or within.width <= 0 or within.height <= 0:
+        return None
+    return (
+        (clipped.x0 - within.x0) / within.width,
+        (clipped.y0 - within.y0) / within.height,
+        (clipped.x1 - within.x0) / within.width,
+        (clipped.y1 - within.y0) / within.height,
+    )
+
+
+def _trim_locks(locked: list[LockedRect]) -> list[LockedRect]:
+    """Drop slivers, merge overlaps in fraction space, and keep the largest LOCK_MAX_RECTS."""
+    kept = [
+        box
+        for box in locked
+        if box[2] - box[0] >= LOCK_MIN_SIDE and box[3] - box[1] >= LOCK_MIN_SIDE
+    ]
+    if not kept:
+        return []
+    # Merged in fraction space with the same padding rule, so two placements of one raster on
+    # two pages do not leave two nearly-identical rectangles in the clause.
+    unit = fitz.Rect(0, 0, 1, 1)
+    merged = _merge_rects([fitz.Rect(*box) for box in kept], LOCK_MIN_SIDE)
+    boxes = [b for b in (_normalize_rect(r, unit) for r in merged) if b is not None]
+    boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    return boxes[:LOCK_MAX_RECTS]
+
+
+def _locked_rects(rect: fitz.Rect, text_rects: list[fitz.Rect]) -> list[LockedRect]:
+    """The picture's reserved rectangles, as fractions of `rect`, from the page's text lines."""
+    if not LOCK_LIVE_TEXT_SURFACES or not text_rects:
+        return []
+    merged = _merge_rects(text_rects, LOCK_MERGE_PAD_PT)
+    padded = [fitz.Rect(r) + (-LOCK_PAD_PT, -LOCK_PAD_PT, LOCK_PAD_PT, LOCK_PAD_PT) for r in merged]
+    boxes = [b for b in (_normalize_rect(r, rect) for r in padded) if b is not None]
+    return _trim_locks(boxes)
+
+
+def _ring_color(
+    img: Image.Image, box: tuple[int, int, int, int], width: int
+) -> tuple[int, int, int] | None:
+    """The median colour of the band just OUTSIDE `box`, or None if there is no room for one."""
+    x0, y0, x1, y1 = box
+    strips = [
+        (x0, max(0, y0 - width), x1, y0),
+        (x0, y1, x1, min(img.height, y1 + width)),
+        (max(0, x0 - width), y0, x0, y1),
+        (x1, y0, min(img.width, x1 + width), y1),
+    ]
+    pixels: list[tuple[int, int, int]] = []
+    for strip in strips:
+        if strip[2] - strip[0] < 1 or strip[3] - strip[1] < 1:
+            continue
+        crop = img.crop(strip)
+        crop.thumbnail((16, 16))
+        pixels.extend(crop.getdata())
+    if not pixels:
+        return None
+    return tuple(round(statistics.median(p[i] for p in pixels)) for i in range(3))  # type: ignore[return-value]
+
+
+def _flat_locks(
+    source_png: bytes, locked: list[LockedRect], record: dict | None = None
+) -> list[LockedRect]:
+    """Keep only the locks that really are a surface the page's text is printed ON.
+
+    Two tests, and the second is the one that matters. Both were got wrong first time round,
+    at a cost worth recording:
+
+      1. IS IT A SURFACE — most of the box is one colour. The first version asked
+         `_is_flat_area`, which demands the WHOLE crop vary by no more than 24 levels, and a
+         caption's box padded by 2pt clips the placard's own dark outline. So the real placard
+         was rejected as "unenforceable" while a uniform patch of the man's sweater was kept.
+         `_ink_share` against the box's own dominant colour tolerates a border crossing the
+         rect and still rejects a box laid over a face.
+      2. IS IT A DISTINCT surface — its colour differs from what surrounds it. This is what
+         separates a placard against a photograph (white inside, artwork outside) from a patch
+         of jumper that a page footer happens to overlap (jumper inside, jumper outside). The
+         second one needs no lock at all: nothing there can fall out from under the text,
+         because there is no edge to fall off. Reserving it anyway is actively harmful — the
+         model is told a rectangle of the picture is spoken for, and paints a blank card into
+         the artwork to satisfy it. That is what put a white box on a man's chest.
+
+    Done here rather than where the rects are built because this is the first point at which
+    both paths — a rasterized region and an extracted xref — have the picture in hand.
+    """
+    if not locked:
+        return []
+    try:
+        with Image.open(io.BytesIO(source_png)) as raw:
+            img = raw.convert("RGB")
+            kept = []
+            for box in locked:
+                pixels = _lock_box(img, box)
+                surface = _backdrop_color(img, pixels)
+                if _ink_share(img, pixels, surface) > LOCK_SOURCE_MAX_INK:
+                    continue  # artwork, not a surface
+                margin = max(
+                    LOCK_RING_MIN_PX,
+                    round(LOCK_RING_SHARE * min(pixels[2] - pixels[0], pixels[3] - pixels[1])),
+                )
+                around = _ring_color(img, pixels, margin)
+                if around is not None and (
+                    max(abs(a - b) for a, b in zip(surface, around)) < LOCK_DISTINCT_MIN
+                ):
+                    continue  # the same stuff inside and out — there is no surface to protect
+                kept.append(box)
+    except Exception:
+        logger.debug("Could not test locked rects against the source", exc_info=True)
+        return locked
+    if record is not None and len(kept) < len(locked):
+        record["locks_unenforceable"] = len(locked) - len(kept)
+    return kept
+
+
+def _locked_rects_for_xref(
+    doc: fitz.Document, xref: int, pages: list[int], skip_page: int | None = None
+) -> tuple[list[LockedRect], bool]:
+    """Locks for a raster, unioned over every page it is printed on, and whether they are usable.
+
+    `_swap_image_in_place` rewrites the XObject once and every placement on every page picks
+    the change up, so the lock set has to be the union across all of them — a placard clear on
+    page 4 and captioned on page 11 is still captioned. Hence `pages_by_xref`, not
+    `unique_xrefs`, which keeps only one page per xref.
+
+    The bool is False when a placement is rotated: a rectangle in image space cannot describe
+    a rotated placement's text, so the whole xref stops being lockable and must not be freed.
+    """
+    if not LOCK_LIVE_TEXT_SURFACES:
+        return [], True
+    found: list[LockedRect] = []
+    for page_num in pages:
+        if skip_page is not None and page_num == skip_page:
+            continue
+        try:
+            page = doc[page_num - 1]
+            placements = page.get_image_rects(xref, transform=True)
+        except Exception:
+            logger.debug("Could not read placements of xref %d on page %d", xref, page_num)
+            continue
+        for rect, matrix in placements:
+            # 0 is upright; 90/180/270 and None (a sheared placement) both mean a rectangle
+            # measured in page space does not map onto one in image space.
+            if _rotation_degrees(matrix) != 0:
+                return [], False
+            for line in _text_rects_in(page, rect):
+                grown = fitz.Rect(line) + (
+                    -LOCK_PAD_PT, -LOCK_PAD_PT, LOCK_PAD_PT, LOCK_PAD_PT
+                )
+                box = _normalize_rect(grown, rect)
+                if box is not None:
+                    found.append(box)
+    return _trim_locks(found), True
+
+
+def _locked_share(locked: list[LockedRect]) -> float:
+    """The share of the picture the locks cover, counting an overlap once."""
+    if not locked:
+        return 0.0
+    merged = _merge_rects([fitz.Rect(*box) for box in locked], 0.0)
+    return min(sum(r.width * r.height for r in merged), 1.0)
+
+
+def _lock_box(img: Image.Image, box: LockedRect) -> tuple[int, int, int, int]:
+    """A locked rect in pixels of `img`, clamped to it and never inside-out."""
+    width, height = img.size
+    x0 = max(0, min(width - 1, round(box[0] * width)))
+    y0 = max(0, min(height - 1, round(box[1] * height)))
+    x1 = max(x0 + 1, min(width, round(box[2] * width)))
+    y1 = max(y0 + 1, min(height, round(box[3] * height)))
+    return x0, y0, x1, y1
+
+
+_LOCK_WHERE_X = ("left", "centre", "right")
+_LOCK_WHERE_Y = ("upper", "middle", "lower")
+
+
+def _lock_where(box: LockedRect) -> str:
+    """Plain words for where a rect sits, from a 3x3 map of its centre.
+
+    The layer of the clause with actual evidence behind it: every spatial rule in every one of
+    these prompts is prose, and prose is what the model has been shown to act on. The
+    percentages and the box_2d beside it are cheap extra signal, not the plan.
+    """
+    cx = (box[0] + box[2]) / 2
+    cy = (box[1] + box[3]) / 2
+    column = _LOCK_WHERE_X[min(2, int(cx * 3))]
+    row = _LOCK_WHERE_Y[min(2, int(cy * 3))]
+    if column == "centre" and row == "middle":
+        return "middle"
+    return f"{row} {column}"
+
+
+def _lock_summary(
+    locked: list[LockedRect], source_png: bytes, compact: bool = False
+) -> str:
+    """The reserved-areas clause for the edit prompt, or "" when there is nothing to reserve.
+
+    `source_png` supplies each rect's colour. The source render is text-free, so the crop
+    inside a locked rect IS the blank surface the caption is printed on — sampling it gives
+    the model the exact colour to hand the rectangle back in.
+    """
+    if not locked:
+        return ""
+    try:
+        with Image.open(io.BytesIO(source_png)) as raw:
+            img = raw.convert("RGB")
+            colours = [_hex(_backdrop_color(img, _lock_box(img, box))) for box in locked]
+    except Exception:
+        logger.debug("Could not sample locked rect colours", exc_info=True)
+        colours = ["" for _ in locked]
+
+    template = LOCK_ITEM_COMPACT if compact else LOCK_ITEM
+    items = []
+    for i, (box, colour) in enumerate(zip(locked, colours), start=1):
+        x0, y0, x1, y1 = box
+        items.append(
+            template.format(
+                i=i,
+                where=_lock_where(box),
+                x0=x0, x1=x1, y0=y0, y1=y1,
+                w=x1 - x0, h=y1 - y0,
+                # box_2d is [y0, x0, y1, x1] on a 0-1000 grid — the convention the model
+                # answers OCR in. See image_localizer's note on why it is the third layer.
+                by0=round(y0 * 1000), bx0=round(x0 * 1000),
+                by1=round(y1 * 1000), bx1=round(x1 * 1000),
+                colour=colour or "flat",
+            )
+        )
+    head = LOCK_CLAUSE_COMPACT if compact else LOCK_CLAUSE_HEAD
+    return head.format(n=len(locked), items="\n".join(items))
+
+
+def _locks_kept(
+    edited_png: bytes, source_png: bytes, locked: list[LockedRect]
+) -> list[int]:
+    """Indices of the locked rects the regeneration did NOT hand back blank and in place.
+
+    The prompt asks for this and the model mostly complies, but "mostly" is a caption printed
+    onto a woman's shoulder. So it is measured, in three steps that each catch a different
+    failure and short-circuit cheaply:
+
+      1. the colour moved — the model put something else entirely there;
+      2. something is drawn on it — a hand, a strap, a shadow crossing the surface;
+      3. the surface came back SMALLER. This is the one the first two miss: a placard shrunk
+         to two-thirds still reads as flat and clean on average, while a third of the caption
+         now hangs off it onto the artwork.
+
+    Run this AFTER _match_background, which forces the generated field to the source's exact
+    hex — without that, step 1's tolerance is measuring the model's colour drift rather than
+    whether the surface is still there.
+    """
+    if not locked:
+        return []
+    try:
+        with Image.open(io.BytesIO(source_png)) as raw:
+            source = raw.convert("RGB")
+        with Image.open(io.BytesIO(edited_png)) as raw:
+            edited = raw.convert("RGB").resize(source.size, Image.LANCZOS)
+    except Exception:
+        logger.debug("Could not verify locked rects", exc_info=True)
+        return []
+
+    failed = []
+    for i, box in enumerate(locked):
+        pixels = _lock_box(source, box)
+        want = _backdrop_color(source, pixels)
+        have = _backdrop_color(edited, pixels)
+        if max(abs(a - b) for a, b in zip(want, have)) > LOCK_BG_TOLERANCE:
+            failed.append(i)
+            continue
+        if _ink_share(edited, pixels, want) > LOCK_MAX_INK:
+            failed.append(i)
+            continue
+        centre = ((pixels[0] + pixels[2]) // 2, (pixels[1] + pixels[3]) // 2)
+        surface = _surface_rect(edited, centre, want, (0, 0, edited.width, edited.height))
+        area = (pixels[2] - pixels[0]) * (pixels[3] - pixels[1])
+        if surface is None:
+            failed.append(i)
+            continue
+        held = fitz.Rect(*surface) & fitz.Rect(*pixels)
+        if held.is_empty or (held.width * held.height) < LOCK_SURFACE_MARGIN * area:
+            failed.append(i)
+    return failed
+
+
+def _restamp_locks(
+    edited_png: bytes, source_png: bytes, locked: list[LockedRect], failed: list[int]
+) -> tuple[bytes, list[int]]:
+    """Paste the source's own pixels back into the locks that failed. Returns (png, repaired).
+
+    Modelled on _restamp_logos, and safe for the same reason it is there: the source render is
+    TEXT-FREE, so the crop inside a locked rect is a blank placard or a patch of flat field,
+    not artwork. Pasting it puts back exactly what the lock asked for. And _match_background
+    has already pulled the generated field onto the source's hex, so on the common case — a
+    caption printed on the picture's own flat background — the paste is invisible.
+
+    Skipped where the surrounding colour has genuinely moved: the model put a different field
+    there, and a rectangle of the old colour dropped into it is a visible patch. Those stay
+    failed and the regeneration is discarded instead.
+    """
+    if not failed:
+        return edited_png, []
+    try:
+        with Image.open(io.BytesIO(source_png)) as raw:
+            source = raw.convert("RGB")
+        with Image.open(io.BytesIO(edited_png)) as raw:
+            edited = raw.convert("RGB").resize(source.size, Image.LANCZOS)
+    except Exception:
+        logger.debug("Could not restamp locked rects", exc_info=True)
+        return edited_png, []
+
+    repaired = []
+    for i in failed:
+        box = _lock_box(source, locked[i])
+        grown = (
+            max(0, box[0] - LOCK_NEIGHBOURHOOD),
+            max(0, box[1] - LOCK_NEIGHBOURHOOD),
+            min(source.width, box[2] + LOCK_NEIGHBOURHOOD),
+            min(source.height, box[3] + LOCK_NEIGHBOURHOOD),
+        )
+        was = _backdrop_color(source, grown)
+        now = _backdrop_color(edited, grown)
+        if max(abs(a - b) for a, b in zip(was, now)) > BACKGROUND_SPREAD:
+            continue
+        edited.paste(source.crop(box), box)
+        repaired.append(i)
+
+    if not repaired:
+        return edited_png, []
+    buf = io.BytesIO()
+    edited.save(buf, format="PNG")
+    return buf.getvalue(), repaired
 
 
 def localize_pdf(pdf_bytes: bytes) -> bytes:
@@ -1302,11 +2034,43 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
         distinct_regions,
     )
 
+    # Which parts of each picture the page's own printed text sits over. Computed here, on the
+    # main thread, because it is the only place the page objects are: _decide_from_png is
+    # handed a page NUMBER, and by then the page is gone. And on `doc`, never `text_free` —
+    # the shadow page has had its text stripped, which is the whole reason the locks are
+    # invisible to the OCR downstream.
+    #
+    # A raster's locks are the union over EVERY page it is printed on: _swap_image_in_place
+    # rewrites the one XObject and all its placements pick the change up, so a placard clear
+    # on page 4 and captioned on page 11 is still captioned. Hence pages_by_xref, not
+    # unique_xrefs, which keeps a single page per xref.
+    locks_by_xref: dict[int, tuple[list[LockedRect], bool]] = {}
+    locks_by_content_key: dict[str, list[LockedRect]] = {}
+    if LOCK_LIVE_TEXT_SURFACES:
+        for xref in unique_xrefs:
+            locks_by_xref[xref] = _locked_rects_for_xref(
+                doc, xref, pages_by_xref.get(xref, []), cover_page_num
+            )
+        # Vector regions are deduped by content_key and edited once, so the same union applies:
+        # the lock set is every region carrying that key, not just the representative one.
+        # Regions are placed with overlay=True, so every text line crossing one really does
+        # end up printed on top of it.
+        for page_num, regions in regions_by_page.items():
+            page = doc[page_num - 1]
+            for region in regions:
+                locks_by_content_key.setdefault(region.content_key, []).extend(
+                    _locked_rects(region.rect, _text_rects_in(page, region.rect))
+                )
+        locks_by_content_key = {
+            key: _trim_locks(boxes) for key, boxes in locks_by_content_key.items()
+        }
+
     with ThreadPoolExecutor(max_workers=CONCURRENT_IMAGES) as executor:
         futures: dict = {}
 
         # Schedule xref-based images.
         for xref, page_num in unique_xrefs.items():
+            locked, mappable = locks_by_xref.get(xref, ([], True))
             futures[
                 executor.submit(
                     _decide,
@@ -1316,6 +2080,8 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
                     xref_contexts[xref],
                     raster_by_xref.get(xref),
                     xref in series_xrefs,
+                    locked_rects=locked,
+                    lock_unmappable=not mappable,
                 )
             ] = ("xref", xref)
 
@@ -1340,6 +2106,7 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
                     region.page_num,
                     region.page_context,
                     caller_veto=None if region.redraw_safe else "outlined_text_panel",
+                    locked_rects=locks_by_content_key.get(content_key, []),
                 )
             ] = ("region", content_key)
 
@@ -1381,10 +2148,17 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
     # Raster images are swapped inside their XObject, once per xref rather than once per
     # placement: the drawing operator never moves, so every page that uses the image keeps
     # the picture's original position, size, rotation and — crucially — z-order.
+    # The soft-mask outcome goes into the audit rather than only the log: a picture that came
+    # back correct but kept an inherited mask is indistinguishable on screen from one that was
+    # never redrawn until you know which of the two happened. See _derive_smask.
+    records_by_xref = {r.get("xref"): r for r in audit_records if r.get("xref") is not None}
     swapped_xrefs = {
         xref
         for xref in unique_xrefs
-        if results.get(xref) is not None and _swap_image_in_place(doc, xref, results[xref])
+        if results.get(xref) is not None
+        and _swap_image_in_place(
+            doc, xref, results[xref], notes=records_by_xref.get(xref)
+        )
     }
     logger.debug("Swapped %d raster xref(s) in place", len(swapped_xrefs))
 
@@ -2364,6 +3138,8 @@ def _regeneration_mode(
     has_baked_text: bool = True,
     information_role: str = "referential",
     contains_logo: bool = True,
+    locked_share: float = 0.0,
+    lock_unmappable: bool = False,
 ) -> str:
     """Which of image_localizer.LOCALIZE_MODES this picture is regenerated with.
 
@@ -2379,15 +3155,22 @@ def _regeneration_mode(
     the cheapest change it can make, which is the skin, the hair and the clothes. Freeing the
     frame is what fixes that, and it is only safe when nothing has to line up afterwards:
 
-      - `has_baked_text` — the decisive one. A recomposed picture and an overlay placed from
-        the original's coordinates cannot both be right; the boxes already drift measurably
-        under a *constrained* edit. No text in the picture, nothing to drift.
+      - `has_baked_text` — text baked into the artwork. A recomposed picture and an overlay
+        placed from the original's coordinates cannot both be right; the boxes already drift
+        measurably under a *constrained* edit. No baked text, nothing to drift.
       - `information_role` — a referential picture is a datum the page states in words, so it
         is not ours to recompose. This normally cannot reach here (VETO_REFERENTIAL_
         REGENERATION already returned), and is re-checked rather than assumed because the
         flag is a flag.
       - `contains_logo` — a mark inside the picture is protected by position, and a redraw
         that moves the frame moves it.
+      - `locked_share` — the page's OWN printed text, which is a separate question from
+        `has_baked_text` and invisible to it: pictures are rendered text-free, so a caption
+        printed onto a placard leaves no trace in the OCR. Small locks are fine, and they are
+        named in the prompt and verified in pixels afterwards. Past LOCK_MAX_AREA_SHARE the
+        picture is pinned rather than locked, and an honest constrained edit is the better
+        trade. `lock_unmappable` is the rotated-placement case, where no rectangle in image
+        space describes the text at all.
       - size and context, as for "context" mode: a redraw needs a real brief and a picture
         big enough to hold a scene, or the freedom is spent inventing detail.
     """
@@ -2400,6 +3183,8 @@ def _regeneration_mode(
         and not has_baked_text
         and not contains_logo
         and information_role == "decorative"
+        and not lock_unmappable
+        and locked_share <= LOCK_MAX_AREA_SHARE
     ):
         return "reimagine"
     return "context"
@@ -2484,6 +3269,8 @@ def _decide_from_png(
     page_context: str = "",
     in_series: bool = False,
     caller_veto: str | None = None,
+    locked_rects: list[LockedRect] | None = None,
+    lock_unmappable: bool = False,
 ) -> tuple[bytes | None, str, dict]:
     """Classify, OCR, and edit a PNG image. Core decision logic used by both xref-extracted
     and rasterized-region paths.
@@ -2499,6 +3286,11 @@ def _decide_from_png(
             the VETO_* guards below. The vector path uses it: whether a cluster is a
             picture or a panel of words is legible in its drawings and not in its pixels,
             so it is decided where the drawings are — see image_regions.redraw_safe.
+        locked_rects: the parts of this picture the page's own printed text sits over, as
+            fractions of it. Named in the edit prompt and verified in pixels afterwards.
+            Computed by the caller, which is where the page object is.
+        lock_unmappable: the caller could not express the locks in image space (a rotated
+            placement), so the frame must not be freed.
 
     Returns: (edited_bytes, status, audit_record)
     """
@@ -2666,10 +3458,21 @@ def _decide_from_png(
             page_context=page_context,
         )
 
-    # `blocks` is the OCR read above, and it is what decides whether the frame can be freed:
-    # every word in this list is painted back afterwards at a box measured on the ORIGINAL, so
-    # a picture that has any is redrawn in place. An empty list here is a real "no text in the
-    # picture" — an OCR that merely failed returned at the ocr_failed branch above.
+    # Two independent kinds of text pin this picture's frame, and both have to be counted.
+    #
+    # `blocks` is the OCR read above — text baked into the artwork, painted back afterwards at
+    # boxes measured on the ORIGINAL, so a picture that has any is redrawn in place. An empty
+    # list here is a real "nothing baked in": an OCR that merely failed returned above.
+    #
+    # `locked` is the page's OWN printed text, which that OCR cannot see at all because the
+    # picture was rendered from a text-free page. Filtered here to the rects that really are
+    # blank surfaces in the source — live text over real artwork is _punch_text_holes' problem,
+    # not a placard to reserve — and then named in the prompt and verified in pixels.
+    locked = _flat_locks(png_bytes, list(locked_rects or []), record)
+    locked_share = _locked_share(locked)
+    record["locked_rects"] = [[round(v, 4) for v in box] for box in locked]
+    record["locked_share"] = round(locked_share, 3)
+
     mode = _regeneration_mode(
         page_context,
         width,
@@ -2677,8 +3480,27 @@ def _decide_from_png(
         has_baked_text=bool(blocks),
         information_role=decision.get("information_role", "referential"),
         contains_logo=bool(decision.get("is_logo")),
+        locked_share=locked_share,
+        lock_unmappable=lock_unmappable,
     )
+    if mode != "reimagine" and not blocks and locked:
+        # Worth saying explicitly in the audit: this is the picture that *would* have been
+        # freely redrawn and was held back by the page printed over it.
+        record["mode_downgraded"] = (
+            f"reimagine->{mode}: "
+            + ("rotated placement" if lock_unmappable else f"locked_share {locked_share:.2f}")
+        )
     record["regeneration_mode"] = mode
+
+    # Both measured on the FULL-RES bytes, not model_png: _downscale_for_model resizes with
+    # LANCZOS, which softens exactly the hard edges _style_summary counts and would report
+    # every line drawing as shaded.
+    style = _style_summary(png_bytes)
+    metrics = _style_metrics(png_bytes)
+    if metrics is not None:
+        record["style_class"] = _style_class(metrics)
+        record["style_metrics"] = {k: round(v, 3) for k, v in metrics.items()}
+
     start = time.time()
     new_image = localize_image(
         model_png,
@@ -2688,6 +3510,8 @@ def _decide_from_png(
         _palette_summary(model_png),
         mode=mode,
         notes=record,
+        style=style,
+        locks=_lock_summary(locked, png_bytes, compact=(mode == "simple")),
     )
     edit_time = time.time() - start
     record["edit_time_sec"] = round(edit_time, 2)
@@ -2719,6 +3543,36 @@ def _decide_from_png(
     # Hold the regenerated picture to the source's background colour before anything else
     # measures it — the prompt asks for this, but only a measurement guarantees it.
     corrected = _match_background(_resize_to(new_image, width, height), png_bytes)
+
+    # Did the reserved rectangles come back? The prompt asks and the model mostly complies,
+    # but "mostly" is a caption printed onto a woman's shoulder, so it is measured. Checked
+    # here — after _match_background, which makes the colour tolerance mean what it says, and
+    # BEFORE the logo-detection and translation calls, so a picture that is about to be thrown
+    # away does not pay for two more model requests.
+    if locked:
+        failed = _locks_kept(corrected, png_bytes, locked)
+        if failed:
+            corrected, repaired = _restamp_locks(corrected, png_bytes, locked, failed)
+            if repaired:
+                record["locks_repaired"] = repaired
+                failed = _locks_kept(corrected, png_bytes, locked)
+        record["locks_lost"] = failed
+        if failed:
+            # No re-edit: see LOCK_REEDIT_PASSES. The backout is the same one a lost-text
+            # regeneration takes — keep the picture as drawn and translate its words — which
+            # is exactly where a bad constrained edit would have landed too.
+            logger.warning(
+                "Page %d: %s — %d of %d reserved area(s) did not come back blank and in "
+                "place; discarding the regeneration so the page's own text still has its "
+                "surface",
+                page_num, ident, len(failed), len(locked),
+            )
+            record["regeneration_discarded"] = "lock_lost"
+            return _text_only_result(
+                png_bytes, width, height, blocks, record, ident, page_num,
+                status="text_translated", page_context=page_context,
+                empty_status="regeneration_discarded",
+            )
 
     # A picture that IS a logo never reaches here — classify_image's is_logo returned it
     # untouched long before the edit. What is still possible is a mark printed inside a
@@ -2813,6 +3667,8 @@ def _decide(
     page_context: str = "",
     raster_source: tuple[bytes, int, int] | None = None,
     in_series: bool = False,
+    locked_rects: list[LockedRect] | None = None,
+    lock_unmappable: bool = False,
 ) -> tuple[bytes | None, str, dict]:
     """Extract a raster image from the PDF and decide whether to localize it.
 
@@ -2830,7 +3686,8 @@ def _decide(
     if raster_source is not None:
         png_bytes, width, height = raster_source
         result_bytes, status, record = _decide_from_png(
-            png_bytes, width, height, f"xref:{xref}", page_num, page_context, in_series
+            png_bytes, width, height, f"xref:{xref}", page_num, page_context, in_series,
+            locked_rects=locked_rects, lock_unmappable=lock_unmappable,
         )
         record["xref"] = xref
         return result_bytes, status, record
@@ -2851,7 +3708,8 @@ def _decide(
 
     png_bytes, width, height = normalized
     result_bytes, status, record = _decide_from_png(
-        png_bytes, width, height, f"xref:{xref}", page_num, page_context, in_series
+        png_bytes, width, height, f"xref:{xref}", page_num, page_context, in_series,
+        locked_rects=locked_rects, lock_unmappable=lock_unmappable,
     )
     # Add xref to the record for backwards compatibility with audit logs
     record["xref"] = xref

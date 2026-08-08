@@ -23,15 +23,33 @@ logger = logging.getLogger(__name__)
 CLASSIFY_MODEL = "gemini-3-flash-preview"  # For classification and text translation
 TEXT_TRANSLATE_MODEL = "gemini-3-flash-preview"  # For translating text to Bangla
 
-# Image generation/editing models, tried in order. Ordered by measured framing fidelity: text is
-# restored onto blank surfaces at positions measured before the edit, so a model that shifts or
-# rescales a placard leaves that text hanging off it. See the table in image_regen.EDIT_MODELS.
+# The image model. One model, no fallback chain — set by the user 2026-08-04.
 #
-# The chain is NOT a quota escape: the image quota is per-project and shared across all image
-# models, so a 429 on one is a 429 on every one of them. It helps only when a model refuses.
-EDIT_MODEL = "gemini-3.1-flash-lite-image"
-EDIT_MODEL_FALLBACKS = ["gemini-2.5-flash-image", "gemini-3.1-flash-image"]
-EDIT_MODELS = [EDIT_MODEL, *EDIT_MODEL_FALLBACKS]
+# What the chain used to be, and why it was the wrong shape for this job. Measured on the Heart
+# Failure manual's cover figure (a person holding a blank placard), placard position after
+# regeneration vs. before — full table in image_regen.EDIT_MODELS:
+#
+#   gemini-3.1-flash-lite-image   IoU 0.95   aspect drift 0.04%   ~9s
+#   gemini-2.5-flash-image        IoU 0.72   aspect drift 2.95%   ~14s   (snaps to a 2:3 bucket)
+#   gemini-3.1-flash-image        IoU 0.68   aspect drift 0.04%   ~19s
+#   gemini-3-pro-image            IoU 0.60   aspect drift 1.08%   ~51s   (reinterprets the most)
+#
+# The chain was ordered by *framing fidelity*, because a pinned edit restores text onto blank
+# surfaces at positions measured BEFORE the edit, so a model that shifts a placard leaves that
+# text hanging off it. The consequence nobody had looked at: the model tried FIRST is the one
+# measured to change the least. On a redraw it returns a competent retouch, the loop is
+# satisfied, and no stronger model is ever called — which is exactly the "you only changed the
+# character" complaint, and no amount of prompt wording could reach it.
+#
+# gemini-3.1-flash-image reinterprets substantially more than the lite model (IoU 0.68 vs 0.95)
+# while holding the aspect ratio as tightly as it does (0.04%), which matters because the
+# picture is printed into a fixed rectangle. ~19s per picture rather than ~9s. It costs no extra
+# QUOTA: that is per-minute and shared across every image model, so a chain was never a quota
+# escape — it only ever helped when a model refused a particular picture, which is the one thing
+# a single model gives up. A refusal now means that picture ships un-localized, recorded in the
+# audit as edit_failed with edit_error="refused".
+EDIT_MODEL = "gemini-3.1-flash-image"
+EDIT_MODELS = [EDIT_MODEL]
 # Attempts per model before moving to the next one (transient 429/503 backoff is handled inside
 # vertex_client.generate_content, so a couple of attempts per model is plenty).
 EDIT_ATTEMPTS_PER_MODEL = 2
@@ -211,7 +229,28 @@ Western hospital corridor.
 cha in a small glass cup; seasonal fruit — aam, kathal, kola, peyara, boroi; served on steel \
 or melamine plates and eaten with the right hand, or with a steel spoon.
 Draw Bangladesh specifically, not a generic "South Asian" or "Middle Eastern" stand-in: no \
-desert, no pagoda, no Gulf skyline, no Western suburban kitchen or lawn."""
+desert, no pagoda, no Gulf skyline, no Western suburban kitchen or lawn.
+
+NOT BANGLADESHI — if any of these is in the original it does NOT survive into your picture. \
+Replace it with whatever fills the same role in Bangladesh, or leave it out:
+  - CLOTHING AND KIT: hi-vis or reflective safety jackets, tabards and vests; work gloves of \
+any colour, mittens, latex gloves outside a clinical scene; hard hats, bicycle helmets, \
+beanies, baseball caps; winter coats, anoraks, fleeces, hoodies, scarves, blazers, ties, \
+suits, jeans; trainers, boots, wellingtons, high heels; Western-cut backpacks and handbags; \
+sunglasses; lanyards and clipboards.
+  - HOUSEHOLD AND STREET: fitted kitchens with wall units and worktops, ovens, kettles, \
+toasters, microwaves, dishwashers, fridges with magnets; sofas with scatter cushions, \
+carpets, fireplaces, radiators, sash or double-glazed windows, net curtains, wallpaper; \
+wheelie bins, letterboxes, garden fences, mown lawns, hedges, kerbed pavements, zebra \
+crossings, Western road signs, cars, Western buses, supermarket trolleys.
+  - FOOD AND TABLE: a knife and fork laid beside a plate, dinner plates on placemats, mugs of \
+milky tea, bottled water, breakfast cereal, sandwiches, toast, a roast dinner.
+  - WEATHER AND LAND: snow, autumn leaves, bare deciduous trees, a grey European sky, pine \
+forest, snow-capped mountains, a Western high street.
+Safety and cold-weather kit is the most persistent of these: a person is NOT localized while \
+they are still wearing the original's gloves, jacket, boots, helmet or hi-vis. Go through \
+every garment and every object a person is wearing, holding or standing next to, one at a \
+time, and ask whether a Bangladeshi in this scene would have it. If not, it goes."""
 
 CONTEXT_CLAUSE = """CONTEXT — the page this picture is printed on says:
 "{context}"
@@ -236,6 +275,7 @@ it, and do not fit it into a square or a 2:3 frame.
   - If you cannot keep a board, card or placard exactly where it is, leave that part of the \
 picture unchanged rather than moving it. A blank surface that has shifted is worse than one \
 that was never adapted: real text is printed onto it afterwards at fixed positions.
+{locks}
 CRITICAL — MATCH THE ORIGINAL'S COLOURS:
   - This picture is printed inside a document, surrounded by the page it sits on. It must \
 still look like it belongs to that page, so the palette is not yours to change.
@@ -247,7 +287,10 @@ with a scene, gradient, texture, or a different colour.
   - Do NOT boost saturation, warm the image up, add new accent colours, or restyle it. \
 A recoloured picture is a failure even if it looks nice on its own.
   - If the original is a flat line drawing or a limited two- or three-colour illustration, \
-keep exactly that style — do not turn it into a photo, a painting, or a shaded 3D render.
+keep exactly that style — do not turn it into a photo, a painting, or a shaded 3D render.{style}
+  - It must look like something PRINTED in a booklet, not something generated: no soft glow, \
+no bloom, no vignette, no gradient mesh, no drop shadows, no glossy or plastic highlights, no \
+depth-of-field blur, no sparkles or bokeh, no over-rendered 3D lighting.
 - Clarity: the output must be CLEARER than the original — cleaner and steadier lines, \
 sharper edges, better-resolved detail, no blur or compression artifacts. Clarity comes \
 from draughtsmanship, not from stronger colour: sharpen the drawing, not the palette.
@@ -302,6 +345,11 @@ crockery, utensils, appliances, vehicles, shopfronts, signage shapes, trees and 
 all in scope, not just the people.
   - Work through the frame element by element and ask of each one: is this what it would look \
 like in Bangladesh? Anything that would not be there is redrawn.
+  - THIS INCLUDES WHAT PEOPLE WEAR AND HOLD. Gloves, hi-vis jackets, tabards, helmets, hats, \
+coats, scarves, boots, trainers, bags and the objects in their hands belong to the original's \
+world, not to its message. Each one is replaced by what a Bangladeshi doing this would have — \
+drawn at the same place and the same size, so the composition is untouched. Keeping the \
+original's gloves or jacket on a Bangladeshi face is the commonest way this task is failed.
 CRITICAL — FOOD RULES. All three apply, in this order:
   1. HALAL ONLY. Never depict pork, ham, bacon, lard, alcohol, beer, wine, or a wine glass. \
 If the original shows one, replace it with a halal food filling the same role.
@@ -342,7 +390,7 @@ same poses, same layout.
 signs, boards and panels keep their edges to the pixel — text is printed onto them afterwards \
 at fixed positions, so one that moves or shrinks leaves that text overlapping the artwork.
 - Keep the SAME colour palette, the same style, and the same background colour as the \
-original.{palette} Do not brighten, restyle, or turn a flat drawing into a photo.
+original.{palette} Do not brighten, restyle, or turn a flat drawing into a photo.{style}
 - Every person must BE Bangladeshi, not a Western person in Bangladeshi clothes — redrawing \
 only the outfit is a failure. Redraw the face itself: South Asian face shape and features, \
 warm brown skin, black or dark brown hair. No blond or light hair, no pale complexion, no \
@@ -359,6 +407,7 @@ SAME food group and the SAME portion as the original (oily fish -> ilish or rui,
 -> lal chal or atta ruti, pulse -> dal, dairy -> doi), served in Bangladeshi dishes.
 - Draw NO text of any kind. Every sign, label or lettered surface comes back blank and clean \
 — the text is restored separately afterwards.
+{locks}
 - Draw NO logo, wordmark, emblem, crest or institutional mark, and never invent or substitute \
 one. Leave its area clean and empty; the original mark is stamped back afterwards, unchanged.
 - The whole frame is localized, not only the people. Changing the faces and the clothes while \
@@ -369,6 +418,11 @@ plastic chairs and a wooden khat, steel or melamine plates, cha in a small glass
 and dal and machher jhol, cycle rickshaws and CNG auto-rickshaws, tea stalls, paddy fields, \
 banana and coconut palms, a pond. Bangladesh specifically — not a generic South Asian, Middle \
 Eastern or Western stand-in.
+- Anything Western that a Bangladeshi would not have goes, including what people are WEARING \
+and HOLDING: no hi-vis jackets, work gloves, mittens, helmets, hard hats, beanies, coats, \
+fleeces, scarves, jeans, trainers or boots; no fitted kitchen, sofa, carpet, radiator, wheelie \
+bin, lawn, car or knife and fork; no snow and no bare winter trees. A person still wearing the \
+original's gloves or jacket has not been localized.
 Focus especially on: {focus}."""
 
 # "reimagine" mode. The picture is drawn again from its meaning rather than edited, so the
@@ -382,6 +436,61 @@ the same activity, the same point being made to the reader. This is what the pic
 not a list of objects to include, and not one word of it may appear as text in the image.
 """
 
+# Reserved rectangles: the parts of a picture the page's own printed text sits over.
+#
+# Those captions are real PDF text at fixed page coordinates and cannot be moved, so whatever
+# surface they are printed on — a placard, a panel, a patch of flat field — has to come back in
+# exactly the same place, the same size, and blank. Everything else in the picture is free,
+# which is the whole point: without locks the only safe instruction is "nothing moves", and
+# that is what reduces a redraw to a change of faces.
+#
+# Assembled by image_processor._lock_summary, which measures the rects and their colours. Three
+# layers per rect, in decreasing order of how far they can be trusted: prose position, then
+# percentages, then box_2d on the 0-1000 grid. box_2d is the convention the model answers OCR
+# in — that is evidence about *reading*, not about drawing — so it is the third layer, and the
+# actual guarantee is the pixel check in image_processor._locks_kept. A marker drawn into the
+# input image would be simpler and is not an option: the model reproduces markers faithfully.
+# NEVER call a reserved rectangle "blank".
+#
+# The first version of this clause said each one "must come back completely BLANK: flat, empty,
+# unmarked surface". The model read "blank surface" as a THING TO DRAW and painted a blank white
+# card, with a border, into the middle of a man's jumper — obeying the instruction exactly as
+# written. A reserved rectangle is not an object to render; it is a piece of the picture that
+# must survive untouched. So the wording says *continue what is already there*, and says
+# outright that adding a card, panel or sign is the failure.
+LOCK_CLAUSE_HEAD = """RESERVED AREAS — {n} rectangle(s) of this picture are already spoken \
+for. The booklet's own printed text is laid over them on the page, at fixed coordinates that \
+cannot move, so whatever surface is at each one has to survive your redraw: same place, same \
+size, same shape, same colour, still smooth and unbroken.
+{items}
+These are NOT things to draw. Do not add a card, a panel, a sign, a placard, a box, a frame, a \
+label or a patch of flat colour at any of them — there is already a surface at that spot and \
+your job is simply to let it continue, exactly as it is, while you redraw everything around \
+it. Equally, do not move, resize, rotate, tilt, re-shape or re-colour it, and do not bring a \
+hand, a limb, an object, a shadow, an outline, a texture or any lettering across it. If the \
+picture you want to draw would put artwork there, put that artwork elsewhere in the frame. A \
+reserved area that has moved, been covered, or had something new drawn into it makes the \
+booklet's printed text unreadable, and the whole picture is thrown away.
+
+You may redraw everything else in this picture freely — that freedom is the point.
+"""
+LOCK_ITEM = """  {i}. the {where} of the frame — from {x0:.0%} to {x1:.0%} across and {y0:.0%} \
+to {y1:.0%} down, about {w:.0%} wide and {h:.0%} tall (box_2d [{by0},{bx0},{by1},{bx1}] on a \
+0-1000 grid). It is smooth {colour} there now; leave it smooth {colour}, unbroken and \
+unmarked, and add nothing to it."""
+# The compact form for SIMPLE_EDIT_INSTRUCTION, whose brevity is deliberate — see the comment
+# above that prompt.
+LOCK_ITEM_COMPACT = """  {i}. from {x0:.0%} to {x1:.0%} across and {y0:.0%} to {y1:.0%} down \
+({where}) — leave the smooth {colour} that is there, and add nothing."""
+LOCK_CLAUSE_COMPACT = """RESERVED — the page's printed text is laid over {n} rectangle(s) of \
+this picture, so the surface already at each one must survive unchanged: same place, same \
+size, same colour, unbroken. Do NOT draw a card, panel, sign or box there — there is a surface \
+there already and it only has to continue.
+{items}
+Everything else in the picture is yours to redraw.
+"""
+
+
 # Written as a *drawing* brief, not an editing one. The edit prompts above are built around a
 # text overlay that is painted back at coordinates measured on the original, so they spend
 # most of their length forbidding movement — and a model told to move nothing satisfies the
@@ -393,7 +502,7 @@ not a list of objects to include, and not one word of it may appear as text in t
 # message, the food group, the number of people doing the thing.
 REIMAGINE_INSTRUCTION = """Draw this picture again as it would be drawn for a health booklet \
 published in Bangladesh, for Bangladeshi readers.
-{context_clause}
+{context_clause}{locks}
 CRITICAL — THIS IS A REDRAW, NOT A RETOUCH:
   - Do not trace the original and swap the faces. Look at what the picture is showing, then \
 draw that same thing as it actually happens in Bangladesh — the people, and also the place \
@@ -405,19 +514,42 @@ specific outcome this instruction exists to prevent.
   - You may recompose within the frame: move, resize, add or drop background and secondary \
 elements, change the setting, change the props, change the camera distance, so long as the \
 result still says exactly what the original said.
+  - EVERYTHING A PERSON IS WEARING OR HOLDING IS DRAWN AGAIN FROM SCRATCH, NOT KEPT. Gloves, \
+jackets, tabards, hats, helmets, boots, bags, tools and whatever is in their hands belong to \
+the original's world, not to its message. Draw the person again from the skin outwards and ask \
+what a Bangladeshi doing this would actually be wearing and holding. Keeping even one garment \
+or one prop from the original — a pair of gloves, a hi-vis jacket, a helmet — is the tell that \
+this was a retouch and not a redraw, and the picture is rejected for it.
+  - THE PEOPLE MAY BE POSED DIFFERENTLY. They may stand differently, face a different way, be \
+seen from a different angle, hold the thing differently, gesture differently, sit where they \
+stood, and be placed differently in the frame. The original's pose is one draughtsman's \
+choice, not part of what the picture teaches: if a Bangladeshi doing this would stand, hold or \
+carry differently, draw that. The same silhouette with a new face in it is precisely the \
+failure this instruction exists to prevent.
+  - A PLAIN BACKGROUND IS NOT A SCENE TO FILL IN. If the original's background is a flat, \
+plain field, that field stays exactly as it is — the same colour, flat and unbroken to the \
+edges. Do not fill it with a room, a street, a landscape or a sky. On a picture like that, \
+localize by what the people ARE, wear, hold, stand on and are surrounded by — a low wooden \
+stool, a gamcha over a shoulder, a steel jug and glass, a woven pati, a handful of shopping in \
+a cloth bag, a shadow on the ground — not by painting a backdrop behind them. Where the \
+original DOES have a setting, that setting becomes Bangladeshi in full.
 
 WHAT MUST NOT CHANGE:
   - THE MESSAGE. Whatever the original teaches the reader, the new picture teaches. The same \
 activity, the same situation, the same instruction being illustrated.
   - THE PEOPLE COUNT AND THEIR ROLES. The same number of people, the same ages and genders, \
-in the same relationship to each other (a doctor and a patient stay a doctor and a patient).
+in the same relationship to each other (a doctor and a patient stay a doctor and a patient). \
+Their POSES are deliberately NOT on this list — see the redraw rules above.
   - THE ASPECT RATIO AND SIZE. Return the picture at exactly the aspect ratio and dimensions \
 you were given. Do not pad it, do not crop it to a square or a 2:3 frame. It is printed into \
 a fixed rectangle on a page.
   - THE DRAWING STYLE. If the original is a flat vector illustration, a line drawing, a \
 two-colour graphic or a watercolour, the new picture is the same kind of drawing, at the same \
 level of detail. Do not turn an illustration into a photograph or a 3D render, and do not \
-turn a photograph into a cartoon.
+turn a photograph into a cartoon.{style}
+    It must look like something PRINTED in a booklet, not something generated: no soft glow, \
+no bloom, no vignette, no gradient mesh, no drop shadows, no glossy or plastic highlights, no \
+depth-of-field blur, no sparkles or bokeh, no over-rendered 3D lighting.
   - THE PALETTE. This picture is printed inside a document and has to look like it belongs to \
 the page around it. Use the same hues, the same lightness, the same saturation, the same \
 overall tone as the original.{palette} A plain background stays plain and stays its original \
@@ -484,7 +616,7 @@ cover of the same booklet published in Bangladesh, for Bangladeshi readers.
 the same places, the same aspect ratio, the same overall design. This must still be \
 recognisably the same booklet, not a new design.
 - Keep the SAME colour palette as the original — the same background colours, the same \
-accent colours, the same tone.{palette} Do not restyle or rebrand it.
+accent colours, the same tone.{palette} Do not restyle or rebrand it.{style}
 - Every person must BE Bangladeshi, not a Western person wearing Bangladeshi clothes. \
 Redraw the face itself — South Asian face shape and features, warm brown skin, black or dark \
 brown hair, no blond or light hair and no pale complexion — and then dress them (saree, \
@@ -499,7 +631,9 @@ the clothing and the touching; the activity, the count and the layout do not cha
 - Any setting, building, vehicle, food or object becomes its Bangladeshi equivalent, drawn \
 in the original's style. A pub, bar, dance floor or beach scene becomes the Bangladeshi \
 setting that serves the same purpose. Changing the faces and the clothing while the rooms, \
-streets, furniture and props stay Western is a failure — the whole cover is localized.
+streets, furniture and props stay Western is a failure — the whole cover is localized, \
+including what the people are wearing and holding: gloves, hi-vis, coats, scarves, helmets, \
+boots and Western bags all go.
 {vocabulary}
 CRITICAL — NO TEXT ANYWHERE:
   - Draw NO letters, words, numbers, logos or symbols. Not in the title area, not on the \
@@ -1107,6 +1241,8 @@ def localize_image(
     palette: str = "",
     mode: str = "context",
     notes: dict | None = None,
+    style: str = "",
+    locks: str = "",
 ) -> bytes | None:
     """Return edited image bytes adapted to Bangladeshi culture, or None on failure.
 
@@ -1118,11 +1254,19 @@ def localize_image(
     page's palette far better than asking it to "match the original" — left to itself it
     returns a warmer, more saturated picture that reads as pasted in from another book.
 
+    `style` is the same idea for the drawing technique (image_processor._style_summary): told
+    only to "keep the style" the model returns its own — a flat screen-print comes back soft-
+    shaded with glow and gradients, and reads as generated.
+
+    `locks` is the reserved-rectangle clause (image_processor._lock_summary): the parts of the
+    picture the page's own printed text sits over, which have to come back blank and in place.
+    Empty for a picture nothing is printed on.
+
     `mode` is "context" (the page's own words steer what is drawn), "simple" (a compact
     cultural swap with no page text), or "reimagine" (the scene is drawn again as a
     Bangladeshi one rather than retouched in place). See LOCALIZE_MODES for when each
-    applies — "reimagine" is only ever chosen for a picture with no baked text, because it
-    is free to recompose and there is then nothing for a text overlay to line up with.
+    applies — "reimagine" needs the frame free, so it is only chosen where nothing has to
+    line up with the original afterwards.
 
     `notes` is a dict the failure reason is written into — pass the caller's audit record so
     that a picture lost to quota is distinguishable from one the model refused.
@@ -1131,19 +1275,25 @@ def localize_image(
     """
     focus = ", ".join(categories) if categories else "any culturally-specific content"
     palette_note = f"\n  - {palette}" if palette.strip() else ""
+    style_note = f"\n    {style}" if style.strip() else ""
+    lock_note = f"\n{locks}" if locks.strip() else ""
     context = page_context.strip()
 
     if mode == "reimagine":
         instruction = REIMAGINE_INSTRUCTION.format(
             focus=focus,
             palette=palette_note,
+            style=style_note,
+            locks=lock_note,
             vocabulary=BANGLADESHI_VOCABULARY,
             context_clause=(
                 REIMAGINE_CONTEXT_CLAUSE.format(context=context) if context else ""
             ),
         )
     elif mode == "simple" or not context:
-        instruction = SIMPLE_EDIT_INSTRUCTION.format(focus=focus, palette=palette_note)
+        instruction = SIMPLE_EDIT_INSTRUCTION.format(
+            focus=focus, palette=palette_note, style=style_note, locks=lock_note
+        )
     else:
         # The image model must NOT draw any text — it garbles glyphs (especially Bangla) and
         # fights the real text layer. Leave every text surface blank; text is restored
@@ -1157,6 +1307,8 @@ def localize_image(
             focus=focus,
             text_instruction=text_instruction,
             palette=palette_note,
+            style=style_note,
+            locks=lock_note,
             vocabulary=BANGLADESHI_VOCABULARY,
             context_clause=CONTEXT_CLAUSE.format(context=context),
         )
@@ -1169,6 +1321,7 @@ def localize_cover(
     mime: str,
     page_context: str = "",
     palette: str = "",
+    style: str = "",
 ) -> bytes | None:
     """Return a Bangladeshi-localized rendering of a whole cover page, or None on failure.
 
@@ -1180,6 +1333,7 @@ def localize_cover(
     context = page_context.strip()
     instruction = COVER_INSTRUCTION.format(
         palette=f"\n  - {palette}" if palette.strip() else "",
+        style=f"\n  - {style}" if style.strip() else "",
         vocabulary=BANGLADESHI_VOCABULARY,
         context_clause=CONTEXT_CLAUSE.format(context=context) if context else "",
     )
@@ -1187,9 +1341,17 @@ def localize_cover(
 
 
 def _run_edit_models(
-    instruction: str, image_bytes: bytes, mime: str, notes: dict | None = None
+    instruction: str,
+    image_bytes: bytes,
+    mime: str,
+    notes: dict | None = None,
+    models: list[str] | None = None,
 ) -> bytes | None:
-    """Send one edit instruction down the model fallback chain; return image bytes or None.
+    """Send one edit instruction to the image model; return image bytes or None.
+
+    `models` defaults to EDIT_MODELS, which is a single model — see the note there. The
+    parameter is kept because the loop is written around a list and a second model may be
+    reinstated; passing one is how to try an alternative without touching the default.
 
     `notes` is written into rather than returned — the caller passes its own audit record, so
     why an edit failed lands in the audit with no extra plumbing. Sets "edit_error" to
@@ -1197,6 +1359,7 @@ def _run_edit_models(
     """
     part = types.Part.from_bytes(data=image_bytes, mime_type=mime)
     contents = [instruction, part]
+    chain = models or EDIT_MODELS
     attempts = 0
     outcome = "error"
 
@@ -1220,7 +1383,7 @@ def _run_edit_models(
             )
             time.sleep(EDIT_QUOTA_COOLDOWN_SEC)
         all_transient = True
-        for model in EDIT_MODELS:
+        for model in chain:
             for attempt in range(1, EDIT_ATTEMPTS_PER_MODEL + 1):
                 temperature = 0.2 + (attempt - 1) * 0.3  # 0.2, 0.5, ...
                 attempts += 1
