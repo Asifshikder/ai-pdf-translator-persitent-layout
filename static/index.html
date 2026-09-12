@@ -103,6 +103,7 @@
     <button class="sidebar-option" data-mode="regenerate">Regenerate PDF Images</button>
     <button class="sidebar-option" data-mode="redesign">Redesign PDF (AI)</button>
     <button class="sidebar-option" data-mode="fix">Fix PDF</button>
+    <button class="sidebar-option" data-mode="digits">Remap Digits</button>
     <button class="sidebar-option" data-mode="split">Split Spread Pages</button>
     <button class="sidebar-option" data-mode="extract_images">Extract Images</button>
     <button class="sidebar-option" data-mode="localize_images">Localize Images</button>
@@ -175,6 +176,12 @@ const MODES = {
     endpoint: '/fix', label: 'Fix Bangla PDF', suffix: '_fix.pdf',
     busy: 'Fixing… re-checking every page for missed translations and overlapping text.',
     hint: 'Upload a translated _bn.pdf. Text that was never translated is translated again, and text overlapping its neighbour is re-fitted. Pages with no problems are left untouched.',
+    acceptType: 'application/pdf,.pdf',
+  },
+  digits: {
+    endpoint: '/digits', label: 'Remap Digits to Bangla', suffix: '_digits.pdf',
+    busy: 'Remapping digits… converting Latin numerals to Bengali (no AI).',
+    hint: 'Upload a translated _bn.pdf. Latin digits such as 2025 become ২০২৫. No AI is used — only a digit map. Pages with no Latin digits are left untouched.',
     acceptType: 'application/pdf,.pdf',
   },
   split: {
@@ -316,7 +323,7 @@ async function uploadFile() {
       throw new Error(msg);
     }
     const summary = res.headers.get('X-Fix-Summary') || res.headers.get('X-Regen-Summary')
-      || res.headers.get('X-Split-Summary');
+      || res.headers.get('X-Split-Summary') || res.headers.get('X-Digit-Summary');
     const blob = await res.blob();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);

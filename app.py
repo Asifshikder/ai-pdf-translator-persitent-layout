@@ -10,6 +10,7 @@ import fitz
 
 import manifest
 import page_fix
+from digit_remap import DIGIT_SUFFIX, remap_pdf
 from docx_export import build_docx
 from docx_merge import MERGE_SUFFIX, DocxMergeError, merge_docx
 from extract_images import extract_images
@@ -159,6 +160,31 @@ async def fix(file: UploadFile = File(...)):
         fixed,
         FIX_SUFFIX,
         {"X-Fix-Summary": summary, "Access-Control-Expose-Headers": "X-Fix-Summary"},
+    )
+
+
+@app.post("/digits")
+async def digits(file: UploadFile = File(...)):
+    """Latin digits → Bengali digits on a translated PDF. No AI calls."""
+    pdf_bytes = await _read_pdf(file)
+    try:
+        remapped, summary = remap_pdf(pdf_bytes)
+    except (ManifestMissing, ManifestUnsupported) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception("Digit remap pipeline failed")
+        raise HTTPException(
+            status_code=500, detail="Digit remap failed. Check the server logs."
+        )
+
+    return _pdf_response(
+        file,
+        remapped,
+        DIGIT_SUFFIX,
+        {
+            "X-Digit-Summary": summary,
+            "Access-Control-Expose-Headers": "X-Digit-Summary",
+        },
     )
 
 
