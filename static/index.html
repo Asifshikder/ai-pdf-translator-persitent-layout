@@ -181,7 +181,7 @@ const MODES = {
   digits: {
     endpoint: '/digits', label: 'Remap Digits to Bangla', suffix: '_digits.pdf',
     busy: 'Remapping digits… converting Latin numerals to Bengali (no AI).',
-    hint: 'Works on any PDF — no prior Translate needed. Latin digits such as 2025 become ২০২৫. No AI is used. Pages with no Latin digits are left untouched.',
+    hint: 'Works on any PDF. Latin digits inside sentences (e.g. between 2 to 3 months → between ২ to ৩ months) are remapped glyph-by-glyph. No AI. Pages with no Latin digits are left untouched.',
     acceptType: 'application/pdf,.pdf',
   },
   split: {

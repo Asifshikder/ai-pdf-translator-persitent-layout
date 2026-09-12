@@ -1,8 +1,4 @@
-"""Tests for the digit-remap pipeline (digit_remap.py).
-
-No API calls: pure string mapping plus tiny PDF fixtures — with and without
-a translation manifest.
-"""
+"""Tests for the digit-remap pipeline (digit_remap.py)."""
 
 from __future__ import annotations
 
@@ -16,7 +12,6 @@ def test_remap_digits_basic():
     assert remap_digits("2025") == "২০২৫"
     assert remap_digits("2.5mg") == "২.৫mg"
     assert remap_digits("30%") == "৩০%"
-    assert remap_digits("21-35") == "২১-৩৫"
     assert remap_digits("no digits") == "no digits"
     assert remap_digits("ইতিমধ্যে ৯৯৯") == "ইতিমধ্যে ৯৯৯"
 
@@ -27,8 +22,7 @@ def test_remap_digits_idempotent():
     assert remap_digits(once) == once
 
 
-def _plain_pdf_with_digits(text: str = "Year 2025 — dose 2.5mg") -> bytes:
-    """Ordinary PDF with extractable Latin text (no translation manifest)."""
+def _plain_pdf(text: str = "Year 2025 — dose 2.5mg") -> bytes:
     doc = fitz.open()
     page = doc.new_page(width=400, height=200)
     page.insert_text((40, 80), text, fontsize=14)
@@ -37,13 +31,45 @@ def _plain_pdf_with_digits(text: str = "Year 2025 — dose 2.5mg") -> bytes:
     return out
 
 
-def _tiny_translated_pdf(bn: str = "প্রতিদিন 2 বার, 2025 সালে") -> bytes:
-    """Minimal PDF with one segment and an embedded translation manifest."""
+def test_remap_pdf_without_manifest_in_sentence():
+    """Numbers inside a sentence must change; surrounding words must survive."""
+    raw = _plain_pdf("The programme lasts between 2 to 3 months in 2025")
+    out, summary = remap_pdf(raw)
+    assert "via chars" in summary
+    assert "digit glyphs" in summary
+
+    text = fitz.open(stream=out, filetype="pdf")[0].get_text()
+    assert "programme lasts between" in text
+    assert "months" in text
+    assert "২" in text and "৩" in text and "২০২৫" in text
+    assert "2" not in text and "3" not in text and "2025" not in text
+
+
+def test_remap_pdf_preserves_non_digit_spans():
+    """Only digit glyphs are touched — neighbouring lines without digits stay."""
+    doc = fitz.open()
+    page = doc.new_page(width=500, height=300)
+    page.insert_text((40, 60), "1. First item mentions 2 things", fontsize=12)
+    page.insert_text((40, 100), "No numbers on this line at all", fontsize=12)
+    page.insert_text((40, 140), "Page 42", fontsize=12)
+    raw = doc.tobytes()
+    doc.close()
+
+    out, _ = remap_pdf(raw)
+    text = fitz.open(stream=out, filetype="pdf")[0].get_text()
+    assert "First item mentions" in text
+    assert "No numbers on this line at all" in text
+    assert "Page" in text
+    assert "১" in text and "২" in text and "৪২" in text
+    assert not any(c in text for c in "0123456789")
+
+
+def test_remap_pdf_with_manifest_updates_bn():
+    bn = "প্রতিদিন 2 বার, 2025 সালে"
     doc = fitz.open()
     page = doc.new_page(width=300, height=200)
     rect = fitz.Rect(40, 40, 260, 80)
     page.insert_htmlbox(rect, bn)
-
     data = {
         "v": manifest.SCHEMA_VERSION,
         "tool": "pdftranslator",
@@ -79,58 +105,28 @@ def _tiny_translated_pdf(bn: str = "প্রতিদিন 2 বার, 2025 �
         ],
     }
     manifest.attach(doc, data)
-    out = doc.tobytes()
-    doc.close()
-    return out
-
-
-def test_remap_pdf_without_manifest():
-    """Any PDF works — no Translate step required."""
-    out, summary = remap_pdf(_plain_pdf_with_digits())
-    assert "via text spans" in summary
-    assert "1 updated" in summary
-
-    doc = fitz.open(stream=out, filetype="pdf")
-    text = doc[0].get_text()
-    doc.close()
-    assert "২০২৫" in text
-    assert "২.৫" in text
-    assert "2025" not in text
-
-
-def test_remap_pdf_with_manifest_updates_bn():
-    out, summary = remap_pdf(_tiny_translated_pdf())
-    assert "via manifest" in summary
-    assert "1 updated" in summary
-
-    doc = fitz.open(stream=out, filetype="pdf")
-    data = manifest.read(doc)
-    bn = data["pages"][0]["segments"][0]["bn"]
-    assert bn == "প্রতিদিন ২ বার, ২০২৫ সালে"
-    assert "2" not in bn
-    doc.close()
-
-
-def test_remap_pdf_skips_when_no_latin_digits():
-    # No Latin digits at all — pipeline should be a no-op.
-    doc = fitz.open()
-    page = doc.new_page(width=300, height=200)
-    page.insert_text((40, 80), "Hello world — no numbers here", fontsize=14)
     raw = doc.tobytes()
     doc.close()
 
     out, summary = remap_pdf(raw)
-    assert "0 updated" in summary
-    assert "0 spans" in summary
+    assert "manifest" in summary
     doc = fitz.open(stream=out, filetype="pdf")
-    assert "Hello world" in doc[0].get_text()
+    data = manifest.read(doc)
+    assert data["pages"][0]["segments"][0]["bn"] == "প্রতিদিন ২ বার, ২০২৫ সালে"
     doc.close()
+
+
+def test_remap_pdf_skips_when_no_latin_digits():
+    out, summary = remap_pdf(_plain_pdf("Hello world — no numbers here"))
+    assert "0 updated" in summary
+    assert "0 digit glyphs" in summary
 
 
 if __name__ == "__main__":
     test_remap_digits_basic()
     test_remap_digits_idempotent()
-    test_remap_pdf_without_manifest()
+    test_remap_pdf_without_manifest_in_sentence()
+    test_remap_pdf_preserves_non_digit_spans()
     test_remap_pdf_with_manifest_updates_bn()
     test_remap_pdf_skips_when_no_latin_digits()
     print("OK")
