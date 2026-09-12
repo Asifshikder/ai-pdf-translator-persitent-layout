@@ -10,20 +10,31 @@ import re
 
 from google.genai import types
 
-from vertex_client import get_client
+from vertex_client import generate_content
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3-flash-preview"
 
 SYSTEM_PROMPT = """You shorten Bangla (Bengali) text that does not fit its layout box.
 You receive a JSON array of objects: {"bn": <Bangla text>, "en": <the English source>}.
 
+This is a patient-facing health manual read by ordinary people in Bangladesh, many of them
+elderly. The shortened line sits on the page beside lines that were not shortened, so it has to
+read as the same voice: Bangladeshi চলিত, the reader addressed as আপনি, the plainest everyday
+word rather than a bookish one. A shorter sentence that sounds stiff is worse than the overflow.
+
+How to shorten: say the same thing in fewer words, the way a person would say it in a hurry —
+drop what the sentence can lose (a repeated আপনার, a filler phrase, a doubled verb) rather than
+swapping in a compressed bookish word. The English is there so you can see what the line means;
+never translate it afresh and never return any of it.
+
 Rules:
 - Return a JSON array of strings with EXACTLY the same number of elements, in the same order.
 - Each string is a SHORTER Bangla rendering of the same meaning — aim for about 30% fewer characters.
-- Preserve every fact, number, date, URL, email address, and abbreviation exactly.
-- Keep the same tone and register. Re-phrase concisely; do not summarise information away.
+- Preserve every fact, number, date, URL, email address, and abbreviation exactly. Digits stay in
+  Latin form as they are printed (999, 2.5mg) — never Bengali numerals.
+- Re-phrase concisely; do not summarise information away.
 - Never return English. Never return an empty string.
 - If a snippet genuinely cannot be shortened, return it unchanged."""
 
@@ -58,14 +69,17 @@ def _acceptable(new: str, item: dict) -> bool:
 def _shorten_chunk(items: list[dict]) -> list[str]:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            response = get_client().models.generate_content(
+            response = generate_content(
                 model=MODEL,
                 contents=json.dumps(items, ensure_ascii=False),
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
                     response_schema={"type": "ARRAY", "items": {"type": "STRING"}},
-                    temperature=0.2,
+                    # Gemini 3 default; see the note in translator._request. A low
+                    # temperature here produced the compressed-bookish rewrite the
+                    # prompt above is trying to avoid.
+                    temperature=1.0,
                 ),
             )
             shortened = json.loads(response.text)

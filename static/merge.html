@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Merge DOCX files</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f4f5f7; --card:#fff; --line:#e0e0e0; --accent:#2f6fed; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181d; --card:#1f232b; --line:#3a3f48; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
+    background: var(--bg); color: #1a1a1a;
+  }
+  @media (prefers-color-scheme: dark) { body { color: #e8e8e8; } }
+
+  header {
+    display: flex; align-items: center; gap: 1rem; padding: .9rem 1.5rem;
+    background: var(--card); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 1.1rem; margin: 0; }
+  header .sub { opacity: .65; font-size: .85rem; margin: 0; }
+  header .spacer { flex: 1; }
+  a.back { color: var(--accent); text-decoration: none; font-size: .9rem; }
+  a.back:hover { text-decoration: underline; }
+
+  .main { display: flex; justify-content: center; padding: 1.5rem; }
+  .card {
+    background: var(--card); border-radius: 12px; padding: 2rem;
+    width: 100%; max-width: 760px; box-shadow: 0 4px 24px rgba(0,0,0,.08);
+  }
+
+  #drop {
+    border: 2px dashed #bbb; border-radius: 10px; padding: 2.5rem 2rem; text-align: center;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: .5rem; transition: border-color .15s, background .15s;
+  }
+  @media (prefers-color-scheme: dark) { #drop { border-color: #444; } }
+  #drop.over { border-color: var(--accent); background: rgba(47,111,237,.06); }
+  #drop .label { opacity: .8; }
+
+  label.field { display: block; font-size: .8rem; font-weight: 700; opacity: .7;
+    margin: 1.5rem 0 .4rem; text-transform: uppercase; letter-spacing: .05em; }
+
+  ol#list { list-style: none; margin: 0; padding: 0; }
+  ol#list li {
+    display: flex; align-items: center; gap: .6rem; padding: .6rem .7rem;
+    border: 1px solid var(--line); border-radius: 8px; margin-bottom: .45rem;
+    background: var(--card); font-size: .92rem; cursor: grab;
+  }
+  ol#list li.dragging { opacity: .4; }
+  ol#list li.over { border-color: var(--accent); }
+  ol#list li .grip { opacity: .4; cursor: grab; user-select: none; }
+  ol#list li .pos {
+    flex-shrink: 0; width: 1.6rem; height: 1.6rem; border-radius: 50%;
+    background: rgba(47,111,237,.12); color: var(--accent); font-weight: 700;
+    font-size: .78rem; display: flex; align-items: center; justify-content: center;
+  }
+  ol#list li .name { flex: 1; word-break: break-all; }
+  ol#list li .size { opacity: .55; font-size: .8rem; flex-shrink: 0; }
+
+  button {
+    padding: .7rem 1rem; font-size: .95rem; border: 0; border-radius: 8px;
+    background: var(--accent); color: #fff; cursor: pointer; font-weight: 600;
+    font-family: inherit;
+  }
+  button:hover:not(:disabled) { opacity: .9; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: transparent; color: inherit; border: 1px solid var(--line);
+    font-weight: 500; }
+  button.small { padding: .3rem .55rem; font-size: .85rem; }
+  button.icon { padding: .2rem .45rem; font-size: .85rem; line-height: 1.2; }
+  #mergeBtn { width: 100%; margin-top: 1.25rem; padding: .9rem; font-size: 1rem; }
+  .row { display: flex; gap: .5rem; margin-top: .7rem; flex-wrap: wrap; align-items: center; }
+  .row .spacer { flex: 1; }
+
+  input[type=text] {
+    width: 100%; padding: .6rem .7rem; border-radius: 8px; border: 1px solid var(--line);
+    background: transparent; color: inherit; font: inherit; font-size: .95rem;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  label.check { display: flex; align-items: center; gap: .5rem; font-size: .92rem;
+    margin-top: 1rem; cursor: pointer; }
+
+  #status { margin-top: 1rem; font-size: .95rem; min-height: 1.2em; font-weight: 600; }
+  #status.error { color: #d33; font-weight: 500; }
+
+  .hint { font-size: .85rem; opacity: .68; line-height: 1.55; }
+  p.hint { margin: .5rem 0 0; }
+
+  .spinner { display: inline-block; width: 14px; height: 14px; vertical-align: -2px;
+    border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+    animation: spin .7s linear infinite; margin-right: .55rem; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Merge DOCX files</h1>
+    <p class="sub">Choose the files, set the order, get one document back.</p>
+  </div>
+  <div class="spacer"></div>
+  <a class="back" href="/">← All tools</a>
+</header>
+
+<div class="main">
+  <div class="card">
+    <div id="drop">
+      <span class="label">Drop DOCX files here or click to choose them</span>
+      <span class="hint">Add as many as you like, in any order — you set the order below.
+        They stay on this machine.</span>
+    </div>
+    <input type="file" id="fileInput" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple hidden>
+
+    <div id="work" class="hidden">
+      <label class="field">Order — first at the top</label>
+      <ol id="list"></ol>
+      <p class="hint">Drag a row to move it, or use the arrows. The first document sets the
+        styles, page size and headers for the merged file.</p>
+
+      <div class="row">
+        <button class="ghost small" id="addBtn">Add more files</button>
+        <button class="ghost small" id="sortBtn">Sort by name</button>
+        <div class="spacer"></div>
+        <button class="ghost small" id="clearBtn">Clear all</button>
+      </div>
+
+      <label class="check"><input type="checkbox" id="pageBreaks" checked>
+        Start each document on a new page</label>
+
+      <label class="field" for="outName">Output file name</label>
+      <input type="text" id="outName" placeholder="merged.docx">
+
+      <button id="mergeBtn">Merge documents</button>
+    </div>
+
+    <div id="status"></div>
+  </div>
+</div>
+
+<script>
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const work = document.getElementById('work');
+const listEl = document.getElementById('list');
+const statusEl = document.getElementById('status');
+const mergeBtn = document.getElementById('mergeBtn');
+const outName = document.getElementById('outName');
+const pageBreaks = document.getElementById('pageBreaks');
+
+// The order of this array IS the merge order: it is what gets appended to the
+// FormData, and multipart parts arrive at the server in the order they are added.
+let docs = [];
+
+function isDocx(f) {
+  return f.name.toLowerCase().endsWith('.docx');
+}
+
+function humanSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function setError(msg) {
+  statusEl.textContent = msg;
+  statusEl.className = 'error';
+}
+
+function addFiles(fileList) {
+  const incoming = Array.from(fileList || []);
+  if (!incoming.length) return;
+
+  const rejected = incoming.filter(f => !isDocx(f)).map(f => f.name);
+  const accepted = incoming.filter(isDocx);
+
+  // Same file dropped twice is a mistake far more often than an intent to
+  // include it twice, and a duplicate is easy to re-add deliberately.
+  const seen = new Set(docs.map(f => f.name + ':' + f.size));
+  const fresh = accepted.filter(f => !seen.has(f.name + ':' + f.size));
+
+  docs = docs.concat(fresh);
+  render();
+
+  if (rejected.length) {
+    setError('Skipped (not .docx): ' + rejected.join(', '));
+  } else if (fresh.length < accepted.length) {
+    statusEl.className = '';
+    statusEl.textContent = 'Skipped ' + (accepted.length - fresh.length) + ' file(s) already in the list.';
+  } else {
+    statusEl.textContent = '';
+    statusEl.className = '';
+  }
+}
+
+function move(from, to) {
+  if (to < 0 || to >= docs.length) return;
+  const [moved] = docs.splice(from, 1);
+  docs.splice(to, 0, moved);
+  render();
+}
+
+function render() {
+  work.classList.toggle('hidden', docs.length === 0);
+  mergeBtn.disabled = docs.length < 2;
+  mergeBtn.textContent = docs.length < 2
+    ? 'Merge documents (choose at least two)'
+    : `Merge ${docs.length} documents`;
+
+  listEl.innerHTML = '';
+  docs.forEach((f, i) => {
+    const li = document.createElement('li');
+    li.draggable = true;
+    li.dataset.index = i;
+    li.innerHTML = `
+      <span class="grip">⠿</span>
+      <span class="pos">${i + 1}</span>
+      <span class="name"></span>
+      <span class="size">${humanSize(f.size)}</span>`;
+    li.querySelector('.name').textContent = f.name;
+
+    const up = document.createElement('button');
+    up.className = 'ghost icon'; up.textContent = '↑'; up.title = 'Move up';
+    up.disabled = i === 0;
+    up.addEventListener('click', () => move(i, i - 1));
+
+    const down = document.createElement('button');
+    down.className = 'ghost icon'; down.textContent = '↓'; down.title = 'Move down';
+    down.disabled = i === docs.length - 1;
+    down.addEventListener('click', () => move(i, i + 1));
+
+    const remove = document.createElement('button');
+    remove.className = 'ghost icon'; remove.textContent = '✕'; remove.title = 'Remove';
+    remove.addEventListener('click', () => { docs.splice(i, 1); render(); });
+
+    li.append(up, down, remove);
+    listEl.appendChild(li);
+  });
+
+  if (!outName.value.trim() && docs.length) {
+    outName.placeholder = docs[0].name.replace(/\.docx$/i, '') + '_merged.docx';
+  }
+}
+
+// --- drag to reorder ---------------------------------------------------------
+let dragIndex = null;
+
+listEl.addEventListener('dragstart', e => {
+  const li = e.target.closest('li');
+  if (!li) return;
+  dragIndex = Number(li.dataset.index);
+  li.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  // Firefox will not start a drag unless something is set.
+  e.dataTransfer.setData('text/plain', String(dragIndex));
+});
+
+listEl.addEventListener('dragover', e => {
+  if (dragIndex === null) return;
+  e.preventDefault();
+  const li = e.target.closest('li');
+  listEl.querySelectorAll('li').forEach(el => el.classList.toggle('over', el === li));
+});
+
+listEl.addEventListener('dragleave', e => {
+  const li = e.target.closest('li');
+  if (li) li.classList.remove('over');
+});
+
+listEl.addEventListener('drop', e => {
+  if (dragIndex === null) return;
+  e.preventDefault();
+  const li = e.target.closest('li');
+  if (li) move(dragIndex, Number(li.dataset.index));
+  dragIndex = null;
+});
+
+listEl.addEventListener('dragend', () => {
+  dragIndex = null;
+  listEl.querySelectorAll('li').forEach(el => el.classList.remove('dragging', 'over'));
+});
+
+// --- file input --------------------------------------------------------------
+drop.addEventListener('click', () => fileInput.click());
+document.getElementById('addBtn').addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  addFiles(fileInput.files);
+  // Reset, or picking the same file again fires no change event.
+  fileInput.value = '';
+});
+
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('over');
+  addFiles(e.dataTransfer.files);
+});
+
+// The page-level handlers stop a file dropped outside the zone from navigating
+// away and losing the list the user just built.
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => e.preventDefault());
+
+document.getElementById('sortBtn').addEventListener('click', () => {
+  docs.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  render();
+});
+
+document.getElementById('clearBtn').addEventListener('click', () => {
+  docs = [];
+  statusEl.textContent = '';
+  statusEl.className = '';
+  render();
+});
+
+// --- merge -------------------------------------------------------------------
+mergeBtn.addEventListener('click', async () => {
+  if (docs.length < 2) return;
+  mergeBtn.disabled = true;
+  statusEl.className = '';
+  statusEl.innerHTML = '<span class="spinner"></span>Merging…';
+
+  try {
+    const form = new FormData();
+    for (const f of docs) form.append('files', f);
+    form.append('page_breaks', pageBreaks.checked ? 'true' : 'false');
+    form.append('output_name', outName.value.trim());
+
+    const res = await fetch('/merge_docx', { method: 'POST', body: form });
+    if (!res.ok) {
+      let msg = 'Merge failed.';
+      try { msg = (await res.json()).detail || msg; } catch {}
+      throw new Error(msg);
+    }
+
+    const summary = res.headers.get('X-Merge-Summary');
+    const blob = await res.blob();
+    const name = (outName.value.trim() || docs[0].name.replace(/\.docx$/i, '') + '_merged.docx')
+      .replace(/(\.docx)?$/i, '.docx');
+
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+    statusEl.textContent = summary ? 'Done — ' + summary : 'Done — the download should start.';
+  } catch (err) {
+    setError(err.message);
+  } finally {
+    mergeBtn.disabled = docs.length < 2;
+  }
+});
+
+render();
+</script>
+</body>
+</html>
