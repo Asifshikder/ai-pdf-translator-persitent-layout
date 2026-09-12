@@ -347,17 +347,27 @@ def _vector_marks(page: fitz.Page) -> list[fitz.Rect]:
 
 
 def _panels(page: fitz.Page) -> list[fitz.Rect]:
-    """Speech bubbles and callout panels: filled shapes with curved edges.
+    """Speech bubbles and callout panels: filled shapes that contain text.
 
     A bubble's outline is a closed curve, so `_rules` — which looks for lines —
     cannot see it, and redaction preserves it. Without this the planner grows a
     quote's box straight through the bubble it lives in.
+
+    A plain rectangle fill counts too — a highlight/"ACTION" box is drawn as a
+    single `re` path with no curve at all, and without this a box's own text
+    grew past its right and bottom edges onto the page background: 17.5-19.5pt
+    below the ACTION panels and 25-31pt past the warning box's right edge on
+    pp.35/64 of the Heart Failure manual. Restricted to a *single* `re` item so
+    multi-path vector artwork (logos, illustrations) isn't misread as a box.
     """
     panels = []
     for drawing in page.get_drawings():
         if drawing["type"] not in ("f", "fs"):
             continue
-        if not any(item[0] == "c" for item in drawing["items"]):
+        items = drawing["items"]
+        has_curve = any(item[0] == "c" for item in items)
+        plain_rect = len(items) == 1 and items[0][0] == "re"
+        if not (has_curve or plain_rect):
             continue
         rect = fitz.Rect(drawing["rect"])
         if rect.get_area() >= PANEL_MIN_AREA:

@@ -146,27 +146,48 @@ called a whole logo is deleted from the localization entirely while a mark insid
 is still protected.
 
 Separately, judge information_role — what the picture is FOR. This is not the same \
-question as whether it can be localized, and you must answer it independently:
-- "referential": the specific thing shown IS a datum the page states in words. Redrawing it \
-as something else would make the page factually WRONG, not merely less local. This is: a \
-drink or a food pictured to define a measure, a unit or a dose ("1.5 units", "one portion = \
-80g"); a labelled specimen, product, tablet or piece of equipment the reader is meant to \
-recognise; one tile of a chart, key, grid or comparison series whose tiles are being \
-contrasted with each other; and any picture printed beside a number, percentage or quantity \
-that describes what is in the picture.
-- "decorative": everything else, INCLUDING ordinary pictures of food and meals. A plate of \
-food illustrating what balanced eating looks like, a family at a meal, someone talking to a \
-nurse, a person walking, a figure holding a sign. These are decorative because the document \
-states nothing factual about the particular dish or the particular person shown. A picture \
-is not referential merely because it shows food, or because the page it sits on is about \
-health.
-Worked examples: a photograph of a plate divided into food groups, printed to show what a \
-balanced diet looks like -> decorative (the groups are what matter, and the redraw is \
-separately required to keep the same food groups and the same portions). One card in a row \
-of eight, each showing a drink beside the number of alcohol units in it -> referential.
-When the two readings are genuinely both arguable, answer "referential" — a picture redrawn \
-when it should not have been is a factual error in the document, while one left alone is \
-merely un-localized."""
+question as whether it can be localized, and you must answer it independently.
+
+"referential" is a NARROW, TECHNICAL category. It is not "important", not "clinical subject \
+matter", and not "printed in a medical booklet". Answer "referential" ONLY when the specific \
+thing drawn is itself the measurement, and redrawing it would make the page's own words \
+FALSE. There are exactly four kinds:
+1. A quantity made visible: a drink, a portion or a dose pictured to DEFINE a measure that \
+the page states in words or numbers — "1.5 units", "one portion = 80g", "take two tablets". \
+The picture is the ruler, so a different picture is a different number.
+2. Anatomy, physiology or a clinical procedure drawn to be accurate: a heart, an artery, a \
+cross-section, an x-ray or scan, a stent or catheter in place, a labelled specimen. The \
+shapes carry the medical fact.
+3. A machine-readable or reproduction-critical mark: a QR code, a barcode, a dial, a gauge, \
+a meter reading, a device the reader must recognise to operate.
+4. One tile of a grid, key or comparison series whose tiles are explicitly being contrasted \
+WITH EACH OTHER, so that changing one breaks the comparison.
+
+"decorative" is EVERYTHING ELSE, and it is the large majority of pictures in a health \
+booklet. It explicitly includes, and you must answer "decorative" for: people of any kind \
+doing anything; a person exercising, walking, cooking, resting, shopping, gardening or \
+sleeping; a patient with a doctor, a nurse or a family member; rooms, kitchens, streets, \
+gardens, shops, waiting rooms and any other setting; vehicles, furniture, crockery, clothing \
+and household objects; meals, plates of food and shopping baskets, INCLUDING a plate drawn \
+to show what balanced eating looks like; and a figure holding a sign, a list or a placard.
+These are decorative because the document states nothing factual about the PARTICULAR person, \
+room, garment or dish shown — it could have been drawn a hundred other ways and taught the \
+same thing. A picture is not referential because it is about health, because it appears in a \
+medical document, because it has a caption, or because it sits near a number that is about \
+something else on the page.
+Worked examples: a photograph of a plate divided into food groups, printed to show what \
+balanced eating looks like -> DECORATIVE (the groups are what matter, and the redraw is \
+separately required to keep the same food groups and the same portions). A man in a hi-vis \
+jacket walking up stairs beside the words "climb stairs every day" -> DECORATIVE (the \
+activity is the fact, not the man or his jacket). A person sitting in an armchair reading a \
+leaflet with a dog on the floor -> DECORATIVE. A cartoon figure holding a blank "FINISH" sign \
+-> DECORATIVE. A stylised diagram of a coronary artery with plaque in it -> referential \
+(kind 2). One card in a row of eight, each showing a drink beside its number of alcohol \
+units -> referential (kinds 1 and 4).
+When the two readings are genuinely both arguable, answer "decorative" UNLESS the picture is \
+one of the four kinds above. A picture left un-localized is the failure this document is \
+being adapted to fix; the four narrow kinds are where the opposite risk actually lives, and \
+they are specific enough to recognise on sight."""
 
 # Three ways to regenerate a picture, chosen per image by image_processor._regeneration_mode:
 #

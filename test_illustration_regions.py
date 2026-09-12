@@ -31,10 +31,12 @@ from image_processor import (
     CONTEXT_MIN_WORDS,
     LOCK_MAX_AREA_SHARE,
     LOCK_MAX_INK,
+    LOCK_MAX_RECTS,
     LOCK_MERGE_PAD_PT,
     LOCK_SOURCE_MAX_INK,
     MAX_RESIDUAL_INK,
     MIN_OVERLAY_HEIGHT,
+    RESIDUAL_MAX_AREA_SHARE,
     SIMPLE_MODE_MAX_PIXELS,
     SNAP_MAX_AREA_GROWTH,
     STYLE_FLAT_MAX_COLORS,
@@ -604,6 +606,50 @@ def test_text_surface_decisions():
     )
     check("…and an erase-only block is not overlaid", not overlay2)
 
+    # A residual box big enough to be artwork rather than lettering is refused. The real one:
+    # a reimagined illustration whose re-OCR boxed a rug, a floor and a sleeping cat, then
+    # painted that whole corner PURE white — the floor was near-white, so _mostly_colored read
+    # the box as uniform and repainted it with the white sampled from the paper beside it.
+    floor = Image.new("RGB", (400, 400), (255, 255, 255))
+    ImageDraw.Draw(floor).rectangle([0, 260, 399, 399], fill=(240, 241, 240))  # near-white floor
+    fbuf = io.BytesIO()
+    floor.save(fbuf, format="PNG")
+    kept, _ = _prepare_text_only_image(
+        fbuf.getvalue(), 400, 400, [], also_erase=[{"bbox": [0.60, 0.62, 0.99, 0.99]}]
+    )
+    after = Image.open(io.BytesIO(kept)).convert("RGB")
+    check(
+        "A residual box covering a tenth of the picture is not painted out",
+        after.getpixel((360, 360)) == (240, 241, 240),
+        f"floor came back {after.getpixel((360, 360))} — repainted with the paper's white",
+    )
+    check(
+        "The size backstop still refuses an obviously oversized residue",
+        RESIDUAL_MAX_AREA_SHARE < 0.114,
+        f"{RESIDUAL_MAX_AREA_SHARE}",
+    )
+
+    # Size is only a backstop. What actually separates a real residue from a misread is
+    # WHERE it is, because the damaging box was *smaller* than the legitimate one.
+    from image_processor import _residual_on_reserved
+    reserved = [(0.789, 0.688, 0.847, 0.825)]  # the surface that was asked to come back blank
+    on_surface = {"text": "z", "bbox": [0.80, 0.74, 0.82, 0.77]}
+    off_surface = {"text": "?", "bbox": [0.739, 0.815, 0.974, 0.986]}  # the real white notch
+    kept = _residual_on_reserved([on_surface, off_surface], reserved)
+    check(
+        "Residue on a reserved surface is still cleaned",
+        kept == [on_surface],
+        f"kept {[b['text'] for b in kept]}",
+    )
+    check(
+        "…while a box running off across the artwork is refused",
+        off_surface not in kept,
+    )
+    check(
+        "With nothing reserved there is nothing to clean",
+        _residual_on_reserved([on_surface], []) == [],
+    )
+
 
 def test_overlay_blocks_do_not_overlap():
     """Tier 1: Two OCR boxes for the same words must not stack two runs of Bangla."""
@@ -974,6 +1020,68 @@ def test_a_moved_placard_is_caught_in_pixels():
     )
 
 
+def test_baked_text_is_reserved_rather_than_pinning_the_frame():
+    """A picture's own words buy their surface a lock, not the whole frame a pin."""
+    print("\n=== Baked Text Locks ===")
+    from image_processor import (
+        _text_lock_boxes, _blocks_covered, _trim_locks, TEXT_LOCK_PAD
+    )
+
+    one_word = [{"text": "FINISH", "bbox": [0.40, 0.70, 0.60, 0.75]}]
+    rects = _text_lock_boxes(one_word)
+    check("An OCR box becomes a reserved rectangle", len(rects) == 1, str(rects))
+    check(
+        "…grown, so a one-line box is not thrown away as a sliver",
+        rects[0][3] - rects[0][1] > 0.05 + TEXT_LOCK_PAD,
+        f"{rects[0]}",
+    )
+    check(
+        "…and it covers the words it was built from",
+        _blocks_covered(one_word, rects),
+    )
+
+    # The load-bearing case: coverage is asked of the FINAL list, after the merge that can
+    # drop a rectangle. A lock set that lost a block must not read as permission to recompose.
+    check(
+        "A block left outside every reserved rect refuses the redraw",
+        not _blocks_covered(one_word, [(0.0, 0.0, 0.1, 0.1)]),
+    )
+    check(
+        "An empty lock list refuses it too, rather than passing vacuously",
+        not _blocks_covered(one_word, []),
+    )
+    check(
+        "A picture with no baked text was already free",
+        _blocks_covered([], []),
+    )
+    check(
+        "A block whose bbox cannot be read refuses the redraw",
+        not _blocks_covered([{"text": "?", "bbox": None}], [(0.0, 0.0, 1.0, 1.0)]),
+    )
+    check(
+        "…and contributes no rectangle either, rather than a wrong one",
+        _text_lock_boxes([{"text": "?", "bbox": [0.5, 0.5]}]) == [],
+    )
+
+    # More captions than a prompt can name: _trim_locks keeps the largest LOCK_MAX_RECTS, and
+    # the blocks it drops have to turn the permission off.
+    many = [
+        {"text": f"w{i}", "bbox": [0.05 + 0.09 * i, 0.02 + 0.09 * i,
+                                   0.09 + 0.09 * i, 0.05 + 0.09 * i]}
+        for i in range(LOCK_MAX_RECTS + 3)
+    ]
+    trimmed = _trim_locks(_text_lock_boxes(many))
+    check(
+        f"A picture with more than {LOCK_MAX_RECTS} captions cannot reserve them all",
+        len(trimmed) <= LOCK_MAX_RECTS < len(many),
+        f"{len(trimmed)} rects for {len(many)} blocks",
+    )
+    check(
+        "…so the frame stays pinned for the blocks that fell out",
+        not _blocks_covered(many, trimmed),
+    )
+
+
 def test_a_pinned_picture_does_not_get_a_free_redraw():
     """Locks buy freedom for the rest of the frame — until they cover too much of it."""
     print("\n=== Pinned Is Not Locked ===")
@@ -1243,20 +1351,41 @@ def test_regeneration_mode():
         _regeneration_mode(plenty, *big, **free),
     )
     for name, override in (
-        ("its words are painted back at the original's coordinates", {"has_baked_text": True}),
+        ("its words have nowhere reserved to land", {"has_baked_text": True}),
         ("the picture IS a datum the page states", {"information_role": "referential"}),
         ("a mark inside it is protected by position", {"contains_logo": True}),
     ):
         got = _regeneration_mode(plenty, *big, **{**free, **override})
         check(f"…but not when {name}", got == "context", got)
     check(
+        "Baked text stops barring a redraw once its boxes are reserved as locks",
+        _regeneration_mode(
+            plenty, *big, **{**free, "has_baked_text": True, "baked_text_locked": True}
+        ) == "reimagine",
+        _regeneration_mode(
+            plenty, *big, **{**free, "has_baked_text": True, "baked_text_locked": True}
+        ),
+    )
+    check(
+        "…but a lock set that does not cover every block still pins the frame",
+        _regeneration_mode(
+            plenty, *big, **{**free, "has_baked_text": True, "baked_text_locked": False}
+        ) == "context",
+        _regeneration_mode(
+            plenty, *big, **{**free, "has_baked_text": True, "baked_text_locked": False}
+        ),
+    )
+    check(
         "A textless icon is still too small to recompose",
         _regeneration_mode(plenty, *small, **free) == "simple",
         _regeneration_mode(plenty, *small, **free),
     )
+    # Deliberately reversed: a redraw brief does not need the page's words, and the old order
+    # sent a big textless illustration on a wordless divider page to "simple" — the one prompt
+    # that is pinned AND carries no room, props or vehicles to redraw from.
     check(
-        "…and so is a textless picture with no brief to redraw from",
-        _regeneration_mode("two words", *big, **free) == "simple",
+        "A textless picture on a wordless page is redrawn rather than dropped to simple",
+        _regeneration_mode("two words", *big, **free) == "reimagine",
         _regeneration_mode("two words", *big, **free),
     )
     check(
@@ -2224,6 +2353,7 @@ if __name__ == "__main__":
     test_live_text_pins_a_surface()
     test_a_raster_locks_every_page_it_is_printed_on()
     test_a_moved_placard_is_caught_in_pixels()
+    test_baked_text_is_reserved_rather_than_pinning_the_frame()
     test_a_pinned_picture_does_not_get_a_free_redraw()
     test_every_prompt_still_formats()
     test_the_prompts_name_the_props_that_must_go()

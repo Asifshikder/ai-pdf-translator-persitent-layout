@@ -5,4 +5,5 @@ pymupdf
 google-genai
 pillow
 python-docx
+docxcompose
 fonttools

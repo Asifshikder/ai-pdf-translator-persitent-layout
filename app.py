@@ -11,6 +11,7 @@ import fitz
 import manifest
 import page_fix
 from docx_export import build_docx
+from docx_merge import MERGE_SUFFIX, DocxMergeError, merge_docx
 from extract_images import extract_images
 from fix_processor import FIX_SUFFIX, fix_pdf
 from image_localizer_pipeline import localize_single_image
@@ -226,6 +227,57 @@ async def localize_images_endpoint(file: UploadFile = File(...)):
     out_name += ext
     headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
     return Response(content=localized_bytes, media_type=file.content_type or "image/jpeg", headers=headers)
+
+
+# --------------------------------------------------------------------------------------
+# Merge DOCX — its own window, because the order of the files is the input.
+#
+# The card on the index page takes one file and posts it; merging needs a list the user
+# can reorder, so it lives at /merge. The endpoint is stateless: the browser posts the
+# files in the chosen order and gets the merged document straight back.
+# --------------------------------------------------------------------------------------
+
+
+@app.get("/merge")
+def merge_window():
+    return FileResponse(os.path.join(BASE_DIR, "static", "merge.html"))
+
+
+@app.post("/merge_docx")
+async def merge_docx_endpoint(
+    files: list[UploadFile] = File(...),
+    page_breaks: bool = Form(True),
+    output_name: str = Form(""),
+):
+    """Merge the uploaded DOCX files, in the order they arrive in the request."""
+    documents = [(os.path.basename(f.filename or ""), await f.read()) for f in files]
+
+    try:
+        merged, summary = merge_docx(documents, page_breaks=page_breaks)
+    except DocxMergeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception("DOCX merge failed")
+        raise HTTPException(status_code=500, detail="Merge failed. Check the server logs.")
+
+    # basename: the field is user-supplied, and a path in it would otherwise ride
+    # through into the Content-Disposition filename.
+    out_name = os.path.basename(output_name.strip())
+    if not out_name:
+        out_name = os.path.splitext(documents[0][0])[0] + MERGE_SUFFIX
+    if not out_name.lower().endswith(".docx"):
+        out_name += ".docx"
+
+    # Expose-Headers: fetch() cannot read a custom header unless it is listed.
+    return Response(
+        content=merged,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f'attachment; filename="{out_name}"',
+            "X-Merge-Summary": summary,
+            "Access-Control-Expose-Headers": "X-Merge-Summary",
+        },
+    )
 
 
 # --------------------------------------------------------------------------------------

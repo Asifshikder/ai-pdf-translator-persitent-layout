@@ -25,6 +25,7 @@ from pdf_processor import (
     _bubble_mask,
     _bubbles,
     _extract_segments,
+    _panel_home,
     _panels,
     _plan_insert_rects,
     _rect_on_ink,
@@ -284,6 +285,47 @@ def test_no_box_escapes_its_bubble(doc):
                 )
     check(
         f"no text box is planned outside its bubble ({checked} checked)",
+        not escapes,
+        f"{len(escapes)} escapes, e.g.\n          " + "\n          ".join(escapes[:3]),
+    )
+
+
+def test_no_box_escapes_its_panel(doc):
+    """No text box may be planned outside a plain-rectangle callout panel.
+
+    A highlight/"ACTION" box is drawn as a single `re` fill with no curve, so it
+    was invisible to `_panels` and `_plan_insert_rects` never capped growth
+    against it: paragraphs grew 17.5-19.5pt past an ACTION box's bottom edge and
+    bullets 25-31pt past a warning box's right edge on pp.35/64 of this manual.
+
+    Growth only, not containment: the planner never shrinks a box below its
+    source, so a source that already reached past the panel's inset (the inset
+    itself, not the growth rule, put it there) is not this test's concern —
+    only growth past whichever edge is further out counts as an escape.
+    """
+    escapes = []
+    checked = 0
+    for page_num in range(1, doc.page_count + 1):
+        page, segments, _ = plan_page(doc, page_num)
+        panels = _panels(page)
+        for seg in segments:
+            if seg.get("bubble_rects"):
+                continue  # sole bubble tenant: inscribed-rect path, not this one
+            home = _panel_home(panels, seg["rect"])
+            if home is None:
+                continue
+            checked += 1
+            ins = seg["insert_rect"]
+            limit_x1 = max(home.x1, seg["rect"].x1)
+            limit_y1 = max(home.y1, seg["rect"].y1)
+            if ins.x1 > limit_x1 + 0.5 or ins.y1 > limit_y1 + 0.5:
+                escapes.append(
+                    f"p{page_num}: box {tuple(round(v) for v in ins)} leaves the "
+                    f"panel at {tuple(round(v) for v in home)} "
+                    f"{seg['text'][:40]!r}"
+                )
+    check(
+        f"no text box is planned outside its panel ({checked} checked)",
         not escapes,
         f"{len(escapes)} escapes, e.g.\n          " + "\n          ".join(escapes[:3]),
     )
@@ -781,6 +823,7 @@ def main() -> int:
         print("\nHeart Failure Manual (full) — speech bubbles")
         test_no_box_escapes_its_bubble(doc)
         test_bubble_text_uses_the_headroom_above_it(doc)
+        test_no_box_escapes_its_panel(doc)
         doc.close()
     else:
         skipped.append(f"{BUBBLE_PDF} not found")

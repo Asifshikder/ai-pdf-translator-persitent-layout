@@ -97,7 +97,7 @@ MAX_PICTURE_ASPECT = 6.0
 STATUS_VOCABULARY = [
     "edit_ok", "text_only", "text_translated", "logo_kept", "classify_kept", "aspect_kept",
     "extract_failed", "decode_failed", "classify_failed", "edit_failed", "ocr_failed",
-    "regeneration_discarded", "swap_failed", "stencil_skipped",
+    "regeneration_discarded", "swap_failed", "stencil_skipped", "cover_declined",
 ]
 
 # Where the per-image audit is written. The endpoint hands back bytes rather than a file, so
@@ -167,6 +167,13 @@ VETO_LARGE_TEXT_DENSE_REGENERATION = False
 # from, because there every box is still over its own text.
 KEEP_REGENERATION_MIN_RESTORED = 0.6
 MAX_SCRIM_SHARE = 0.5
+# …but only once there are enough placed blocks for that share to mean anything. "Drift" is a
+# claim about the frame as a whole, and a fraction over one or two blocks cannot support it:
+# a picture with a single word in it scores 0.0 or 1.0 and nothing else, so ONE block landing
+# on a plate — an ordinary, already-handled outcome — read as 1.0 > 0.5 and threw the redraw
+# away. That made any picture carrying exactly one line of text permanently un-localizable,
+# and it did so while reporting restored_share 1.0, i.e. every word successfully placed.
+FRAMING_DRIFT_MIN_BLOCKS = 4
 
 # Words of surrounding page text needed before "context" mode is worth using. Below this the
 # picture is regenerated in "simple" mode instead — see image_localizer.LOCALIZE_MODES for
@@ -242,7 +249,15 @@ LOCK_REEDIT_PASSES = 0
 # single full-page raster underneath the (preserved, already-translated) text layer.
 ENABLE_COVER_LOCALIZATION = True
 COVER_PAGE_NUM = 1  # 1-based; only the first page is ever treated as a cover
-COVER_MAX_TEXT_LINES = 30  # a cover is a title and a few lines, not a page of prose
+# A cover is a title and a few lines, not a page of prose. Raised from 30 after a real miss:
+# this pipeline is normally pointed at an ALREADY-TRANSLATED document, and Bangla wraps to
+# more lines than the English it replaced, so a cover that measured comfortably under the
+# limit in English arrives here at 29 and the next one tips over. A cover silently ceasing to
+# be a cover is expensive — page 1 of these manuals is pure vector art with no raster xrefs
+# and no accepted cluster, so nothing else in the pipeline picks it up and the whole front
+# cover ships untouched. The failure this guards against is a page-range slice that opens on
+# a body page, which carries seventy-plus lines, so there is room to move.
+COVER_MAX_TEXT_LINES = 45
 COVER_MIN_INK_COVERAGE = 0.12  # fraction of the page covered by images/drawings
 COVER_DPI = 150  # a full A4 page at 150dpi is ~1240x1754 — plenty for the edit model
 COVER_ID = "cover"  # key for the cover in the results/statuses/audit maps
@@ -937,7 +952,7 @@ def _page_ink_coverage(page: fitz.Page) -> float:
     return sum(1 for p in pixels if p < 245) / len(pixels)
 
 
-def _detect_cover_page(doc: fitz.Document) -> int | None:
+def _detect_cover_page(doc: fitz.Document, notes: dict | None = None) -> int | None:
     """The 1-based page number of the front cover, or None if this document has no cover.
 
     A cover is the first page, and it is a picture with a title on it: little text, and most
@@ -947,10 +962,14 @@ def _detect_cover_page(doc: fitz.Document) -> int | None:
     ink, and regenerating it would replace a white page with an invented illustration.
     """
     if not ENABLE_COVER_LOCALIZATION or len(doc) < COVER_PAGE_NUM:
+        if notes is not None:
+            notes["declined"] = "disabled" if not ENABLE_COVER_LOCALIZATION else "no_page"
         return None
     page = doc[COVER_PAGE_NUM - 1]
     lines = _text_line_count(page)
     coverage = _page_ink_coverage(page)
+    if notes is not None:
+        notes.update({"text_lines": lines, "ink_coverage": round(coverage, 3)})
     if lines > COVER_MAX_TEXT_LINES or coverage < COVER_MIN_INK_COVERAGE:
         logger.info(
             "Page %d is not being treated as a cover: %d text lines (max %d), "
@@ -958,6 +977,10 @@ def _detect_cover_page(doc: fitz.Document) -> int | None:
             COVER_PAGE_NUM, lines, COVER_MAX_TEXT_LINES, coverage * 100,
             COVER_MIN_INK_COVERAGE * 100,
         )
+        if notes is not None:
+            notes["declined"] = (
+                "too_much_text" if lines > COVER_MAX_TEXT_LINES else "too_little_ink"
+            )
         return None
     logger.info(
         "Page %d looks like a front cover (%d text lines, %.0f%% ink) — localizing it whole",
@@ -1581,6 +1604,112 @@ def _locked_rects(rect: fitz.Rect, text_rects: list[fitz.Rect]) -> list[LockedRe
     return _trim_locks(boxes)
 
 
+# Grown around an OCR box before it is reserved. An OCR box is drawn tight to the words, and
+# two things need the slack: LOCK_MIN_SIDE would otherwise drop a single short word as a
+# sliver, and the surface the words sit on is always a little larger than the words.
+TEXT_LOCK_PAD = 0.012  # of the picture's short side, per edge
+
+
+def _block_boxes(blocks: list[dict]) -> list[LockedRect] | None:
+    """Every OCR block's bbox as a normalized rect, or None if any of them is unusable.
+
+    None rather than a shorter list on purpose: the callers use this to decide whether the
+    picture's words can all be protected, and a block silently missing from the list is
+    indistinguishable from a picture that never had it — which is how a frame gets freed
+    under text nobody accounted for.
+    """
+    boxes: list[LockedRect] = []
+    for block in blocks:
+        bbox = block.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return None
+        try:
+            x0, y0, x1, y1 = (float(v) for v in bbox)
+        except (TypeError, ValueError):
+            return None
+        if not (x1 > x0 and y1 > y0):
+            return None
+        boxes.append((max(0.0, x0), max(0.0, y0), min(1.0, x1), min(1.0, y1)))
+    return boxes
+
+
+def _text_lock_boxes(blocks: list[dict]) -> list[LockedRect]:
+    """The picture's OWN baked-text boxes, grown, ready to be reserved like a live-text lock.
+
+    Deliberately NOT passed through `_flat_locks`. That asks whether the box is a blank,
+    distinct surface in the SOURCE, and a rectangle drawn around printed words never is — it
+    is full of the ink of those words, so every one of them would be discarded as
+    unenforceable. The question being asked here is the other one, "will this surface still
+    be there when the redraw comes back", and `_locks_kept` answers it on the RESULT, where
+    the model has been told to hand every text surface back blank.
+    """
+    boxes = _block_boxes(blocks)
+    if not boxes:
+        return []
+    return [
+        (
+            max(0.0, x0 - TEXT_LOCK_PAD),
+            max(0.0, y0 - TEXT_LOCK_PAD),
+            min(1.0, x1 + TEXT_LOCK_PAD),
+            min(1.0, y1 + TEXT_LOCK_PAD),
+        )
+        for x0, y0, x1, y1 in boxes
+    ]
+
+
+def _residual_on_reserved(residual: list[dict], reserved: list[LockedRect]) -> list[dict]:
+    """Keep only the residual boxes that fall on a surface we asked to come back blank.
+
+    See RESIDUAL_RESERVED_GROW. Containment rather than intersection: a box that merely
+    clips a reserved rect and then runs out across the artwork is the misread this exists to
+    refuse, and it is the shape the damaging case actually had — a box overlapping the
+    corner of a reserved rect and extending over a rug, a floor and half the picture's width.
+
+    With no reserved rects there is nothing to clean, and the caller only builds a residual
+    list at all when the picture had baked text, so an empty result here is the correct
+    "nothing to do" rather than a silent loss.
+    """
+    if not residual or not reserved:
+        return []
+    grown = []
+    for x0, y0, x1, y1 in reserved:
+        dx, dy = RESIDUAL_RESERVED_GROW * (x1 - x0), RESIDUAL_RESERVED_GROW * (y1 - y0)
+        grown.append(fitz.Rect(x0 - dx, y0 - dy, x1 + dx, y1 + dy))
+    kept = []
+    for block in residual:
+        bbox = block.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            box = fitz.Rect(*(float(v) for v in bbox))
+        except (TypeError, ValueError):
+            continue
+        if any(box in rect for rect in grown):
+            kept.append(block)
+    return kept
+
+
+def _blocks_covered(blocks: list[dict], locked: list[LockedRect]) -> bool:
+    """True if every one of the picture's words falls inside some reserved rectangle.
+
+    This is the permission to free the frame, and it has to be asked of the FINAL lock list
+    rather than of the text locks alone. `_trim_locks` merges and then keeps only the largest
+    LOCK_MAX_RECTS, so a picture whose live-text locks and baked-text locks together overflow
+    the cap can lose a text rect in the merge — and deciding before the merge would free the
+    frame under exactly the words that were just dropped. A block can also fall out as a
+    sliver below LOCK_MIN_SIDE. Both read as "not covered", which pins the frame.
+    """
+    boxes = _block_boxes(blocks)
+    if boxes is None:
+        return False
+    if not boxes:
+        return True  # nothing baked in: the frame was already free
+    if not locked:
+        return False
+    reserved = [fitz.Rect(*rect) for rect in locked]
+    return all(any(fitz.Rect(*box) in rect for rect in reserved) for box in boxes)
+
+
 def _ring_color(
     img: Image.Image, box: tuple[int, int, int, int], width: int
 ) -> tuple[int, int, int] | None:
@@ -1902,7 +2031,8 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
     # _detect_cover_page. Detected before anything else, because everything printed on that
     # page is about to be replaced by a single raster: sending its photos through the edit
     # model individually would buy pictures that are then redacted away.
-    cover_page_num = _detect_cover_page(doc)
+    cover_notes: dict = {}
+    cover_page_num = _detect_cover_page(doc, cover_notes)
     cover_source: tuple[bytes, int, int] | None = None
     cover_context = ""
     if cover_page_num is not None:
@@ -2027,6 +2157,29 @@ def localize_pdf(pdf_bytes: bytes) -> bytes:
     statuses: dict[int | str, str] = {}
     blocks_by_id: dict[int | str, list[dict]] = {}  # xref or content_key -> text blocks
     audit_records: list[dict] = []
+
+    # A cover that was NOT treated as one gets a record too. Until this, declining left no
+    # trace anywhere but a log line: three consecutive runs shipped the front cover entirely
+    # un-localized and the audit's only evidence was that page 1 was missing from a file that
+    # never claims to list every page. "The cover was considered and refused, and here is the
+    # measurement that refused it" is a different fact from "no cover was found", and only the
+    # first one can be acted on.
+    if cover_page_num is None and cover_notes:
+        statuses[COVER_ID] = "cover_declined"  # so the run summary says it, not just the file
+        audit_records.append({
+            "ident": COVER_ID,
+            "page": COVER_PAGE_NUM,
+            "mode": "cover",
+            "status": "cover_declined",
+            "untouched": True,
+            "cover_declined": cover_notes.get("declined", "unknown"),
+            "cover_text_lines": cover_notes.get("text_lines"),
+            "cover_ink_coverage": cover_notes.get("ink_coverage"),
+            "cover_limits": {
+                "max_text_lines": COVER_MAX_TEXT_LINES,
+                "min_ink_coverage": COVER_MIN_INK_COVERAGE,
+            },
+        })
 
     logger.info(
         "Found %d unique raster images + %d unique vector illustration signatures to process",
@@ -2858,6 +3011,25 @@ SCRIM_LIGHTEN = 45
 # An OCR box this large is not a label, it is the picture — the case _mostly_colored catches
 # on the erase path. Plating it would paint the artwork out.
 SCRIM_MAX_AREA_SHARE = 0.25
+# The same test for a *residual* box — lettering the model drew after being told not to — and
+# tighter, because unlike an overlay box nothing is ever written back into a residual one:
+# refusing to erase costs nothing, while erasing wrongly costs a hole in the artwork.
+# A backstop only. Size cannot be the real discriminator here and it was a mistake to try:
+# measured on one illustration, a genuine two-word residue was 5.8% of a 200x200 fixture while
+# a misread that punched a white hole through a rug and a floor was 4.0% of a 960x1092
+# picture — the bad one SMALLER than the good one. See RESIDUAL_RESERVED_GROW for the test
+# that actually separates them.
+RESIDUAL_MAX_AREA_SHARE = 0.08
+
+# What makes a residual box legitimate is not its size but WHERE it is. The residual pass has
+# one job: clean the surfaces the model was told to hand back blank, on which it drew anyway.
+# It is not a licence to repaint anywhere the re-OCR reports a letter — and on a recomposed
+# picture that is exactly what it becomes, because re-OCR on redrawn artwork returns boxes
+# around things that are not text at all: a rug's fringe, a sleeping cat, a fold of cloth.
+# So a residual box is erased only where it falls inside a rectangle that was actually
+# reserved, grown to allow for the surface having moved with the composition. The growth
+# matches _anchor_box's ANCHOR_MAX_SHIFT, which is the same question asked of the same drift.
+RESIDUAL_RESERVED_GROW = 0.75
 
 
 def _plate_color(img: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int]:
@@ -2973,6 +3145,28 @@ def _prepare_text_only_image(
         return bg, painted
 
     for b in also_erase or []:
+        box = box_of(b)
+        if box is None:
+            continue
+        # The same "that is the picture, not a label" guard the overlay path applies below,
+        # and tighter, because these boxes are a different kind of thing: stray lettering the
+        # model drew after being told not to. Real residue is a word or two. A big box is the
+        # re-OCR misreading artwork — a rug's fringe, a cat, a fold of cloth — and erasing it
+        # is pure loss, since nothing is written back into a residual box.
+        #
+        # It is only unsafe in one direction, and that direction bites: `erase` samples a
+        # background from the ring and paints the whole box with it, and `_mostly_colored`
+        # compares within SNAP_TOLERANCE, so a box spanning a near-white floor next to white
+        # paper reads as uniform and comes back painted PURE white. That is what put a white
+        # notch through the corner of the first reimagined illustration — over a rug and a
+        # floor that were merely close to white, not white.
+        if (box[2] - box[0]) * (box[3] - box[1]) > RESIDUAL_MAX_AREA_SHARE * W * H:
+            logger.debug(
+                "Ignoring a residual box that covers %.1f%% of the picture: %r",
+                100 * (box[2] - box[0]) * (box[3] - box[1]) / max(W * H, 1),
+                (b.get("text") or "")[:40],
+            )
+            continue
         erase(b)
 
     overlay_blocks: list[dict] = []
@@ -3140,6 +3334,7 @@ def _regeneration_mode(
     contains_logo: bool = True,
     locked_share: float = 0.0,
     lock_unmappable: bool = False,
+    baked_text_locked: bool = False,
 ) -> str:
     """Which of image_localizer.LOCALIZE_MODES this picture is regenerated with.
 
@@ -3158,6 +3353,15 @@ def _regeneration_mode(
       - `has_baked_text` — text baked into the artwork. A recomposed picture and an overlay
         placed from the original's coordinates cannot both be right; the boxes already drift
         measurably under a *constrained* edit. No baked text, nothing to drift.
+        `baked_text_locked` is the way out of that, and it is why this is no longer a hard
+        bar. The overlay does not actually need the whole frame pinned — it needs the few
+        rectangles it writes into to still be there. So the OCR boxes are handed to the same
+        lock machinery the page's live text already uses: named in the prompt by
+        `_lock_summary`, verified in pixels by `_locks_kept`, repaired by `_restamp_locks`,
+        and the regeneration discarded if a surface really did move. Everything OUTSIDE those
+        few rectangles is then free to be redrawn, which is the whole picture in every case
+        that matters — a figure with one word on their shirt was being retouched rather than
+        redrawn to protect a box covering 2% of the frame.
       - `information_role` — a referential picture is a datum the page states in words, so it
         is not ours to recompose. This normally cannot reach here (VETO_REFERENTIAL_
         REGENERATION already returned), and is re-checked rather than assumed because the
@@ -3176,17 +3380,22 @@ def _regeneration_mode(
     """
     if width * height <= SIMPLE_MODE_MAX_PIXELS:
         return "simple"
-    if len(page_context.split()) < CONTEXT_MIN_WORDS:
-        return "simple"
     if (
         REIMAGINE_TEXTLESS_PICTURES
-        and not has_baked_text
+        and (not has_baked_text or baked_text_locked)
         and not contains_logo
         and information_role == "decorative"
         and not lock_unmappable
         and locked_share <= LOCK_MAX_AREA_SHARE
     ):
+        # Tested BEFORE the context-words check on purpose. A redraw brief does not need the
+        # page's words the way a pinned edit does — REIMAGINE_CONTEXT_CLAUSE is optional and
+        # the vocabulary carries the brief — so a big illustration on a wordless divider page
+        # used to fall through to "simple", the one prompt that is both pinned AND has no
+        # Bangladeshi vocabulary in it. That is the worst of the three for this document.
         return "reimagine"
+    if len(page_context.split()) < CONTEXT_MIN_WORDS:
+        return "simple"
     return "context"
 
 
@@ -3469,9 +3678,36 @@ def _decide_from_png(
     # blank surfaces in the source — live text over real artwork is _punch_text_holes' problem,
     # not a placard to reserve — and then named in the prompt and verified in pixels.
     locked = _flat_locks(png_bytes, list(locked_rects or []), record)
-    locked_share = _locked_share(locked)
-    record["locked_rects"] = [[round(v, 4) for v in box] for box in locked]
+
+    # The picture's own baked text, reserved the same way, so that having words in it stops
+    # being a reason to retouch the whole frame instead of redrawing it. Merged into one list
+    # because everything downstream — the prompt clause, the pixel check, the repair, the
+    # discard — treats a reserved rectangle the same whether the words that need it are
+    # printed by the page or drawn into the artwork.
+    # HARD locks: the page's own printed text. Its coordinates are fixed on the page and
+    # nothing here can move it, so the surface under it must come back exactly where it was —
+    # verified below, and the regeneration discarded if it did not.
+    #
+    # SOFT locks: the picture's own baked text. Named to the model the same way, because a
+    # surface that stays put is still the outcome that makes everything downstream easy — but
+    # NOT verified and never grounds for discarding, because this text is painted back by US.
+    # It is free to follow the artwork, and `_prepare_text_only_image(anchor=True)` already
+    # goes and finds where the surface actually landed. Verifying these as hard locks is what
+    # the first version of this did, and it made the change pointless: the picture correctly
+    # reached "reimagine", the model correctly recomposed, the one small surface correctly
+    # moved with it, and the good redraw was then thrown away as "lock_lost" — a redraw
+    # rejected for doing exactly what it was asked to do.
+    soft_locked = _trim_locks(_text_lock_boxes(blocks))
+    # Hard locks first so the LOCK_MAX_RECTS cap can only ever cost a soft one.
+    named = (locked + [b for b in soft_locked if b not in locked])[:LOCK_MAX_RECTS]
+    text_locks_complete = _blocks_covered(blocks, named)
+    locked_share = _locked_share(named)
+    record["locked_rects"] = [[round(v, 4) for v in box] for box in named]
     record["locked_share"] = round(locked_share, 3)
+    record["hard_locks"] = len(locked)
+    if soft_locked:
+        record["text_locks"] = len(soft_locked)
+        record["text_locks_complete"] = text_locks_complete
 
     mode = _regeneration_mode(
         page_context,
@@ -3482,6 +3718,7 @@ def _decide_from_png(
         contains_logo=bool(decision.get("is_logo")),
         locked_share=locked_share,
         lock_unmappable=lock_unmappable,
+        baked_text_locked=text_locks_complete,
     )
     if mode != "reimagine" and not blocks and locked:
         # Worth saying explicitly in the audit: this is the picture that *would* have been
@@ -3511,7 +3748,9 @@ def _decide_from_png(
         mode=mode,
         notes=record,
         style=style,
-        locks=_lock_summary(locked, png_bytes, compact=(mode == "simple")),
+        # Both kinds are named — a surface that stays put is the easy outcome either way.
+        # Only the hard ones are enforced afterwards.
+        locks=_lock_summary(named, png_bytes, compact=(mode == "simple")),
     )
     edit_time = time.time() - start
     record["edit_time_sec"] = round(edit_time, 2)
@@ -3549,6 +3788,12 @@ def _decide_from_png(
     # here — after _match_background, which makes the colour tolerance mean what it says, and
     # BEFORE the logo-detection and translation calls, so a picture that is about to be thrown
     # away does not pay for two more model requests.
+    #
+    # `locked`, NOT `named`: only the hard locks are enforceable. The page's printed text is
+    # laid over this picture at coordinates that cannot be changed, so if its surface moved
+    # the text lands on artwork and the picture has to go back. The picture's OWN text is a
+    # different case entirely — we place that ourselves, afterwards, wherever the surface
+    # ended up — and holding it to this test rejects good redraws for recomposing.
     if locked:
         failed = _locks_kept(corrected, png_bytes, locked)
         if failed:
@@ -3606,6 +3851,14 @@ def _decide_from_png(
     # the restamp a few lines above.
     residual = _extract_text_blocks(_downscale_for_model(corrected), "image/png") if blocks else []
     residual = _outside_logos(residual, logos)
+    # …and only on the surfaces that were reserved in the first place. Without this the pass
+    # repaints wherever the re-OCR thinks it sees a letter, which on a redrawn picture is
+    # artwork — it punched a white rectangle through the corner of the first reimagined
+    # illustration, over a rug and a floor that were merely close to white.
+    before = len(residual)
+    residual = _residual_on_reserved(residual, named)
+    if before != len(residual):
+        record["residual_off_surface"] = before - len(residual)
     if residual:
         logger.info(
             "Page %d: %s — model redrew %d text block(s) it was told to leave blank; erasing",
@@ -3640,14 +3893,32 @@ def _decide_from_png(
     record["restored_share"] = round(share, 3)
     record["anchored_blocks"] = len(overlay_blocks) - scrims
     record["scrim_blocks"] = scrims
-    if blocks and (share < KEEP_REGENERATION_MIN_RESTORED or scrim_share > MAX_SCRIM_SHARE):
-        why = "text_loss" if share < KEEP_REGENERATION_MIN_RESTORED else "framing_drift"
+    if blocks and share < KEEP_REGENERATION_MIN_RESTORED:
+        why = "text_loss"
+    elif len(overlay_blocks) >= FRAMING_DRIFT_MIN_BLOCKS and scrim_share > MAX_SCRIM_SHARE:
+        why = "framing_drift"
+    else:
+        why = None
+    if why:
         logger.warning(
             "Page %d: %s — discarding the regeneration (%s: %d of %d blocks restored, %d of "
             "those on a plate); translating the original's text instead",
             page_num, ident, why, len(overlay_blocks), len(blocks), scrims,
         )
         record["regeneration_discarded"] = why
+        # Kept under their own keys because the fallback below runs the whole placement again
+        # on the ORIGINAL picture and overwrites restored_share, anchored_blocks and
+        # scrim_blocks with its own numbers. The audit then showed a discard reason next to
+        # measurements that had nothing to do with the decision — one record read
+        # "framing_drift" beside "scrim_blocks: 0", which is not a state that can discard
+        # anything, and cost real time to understand.
+        record["discarded_on"] = {
+            "blocks": len(blocks),
+            "placed": len(overlay_blocks),
+            "restored_share": round(share, 3),
+            "scrim_blocks": scrims,
+            "scrim_share": round(scrim_share, 3),
+        }
         return _text_only_result(
             png_bytes, width, height, blocks, record, ident, page_num,
             status="text_translated", logos=logos, page_context=page_context,

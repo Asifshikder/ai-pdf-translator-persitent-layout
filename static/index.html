@@ -110,6 +110,9 @@
          mode of the form above. Plain link, and a class of its own, so none of the mode
          JS applies to it. -->
     <a class="sidebar-link" href="/pagefix">Fix a Page (AI) ↗</a>
+    <!-- Its own window too: merging takes a list of files in a chosen order, which the
+         single-file card above cannot express. -->
+    <a class="sidebar-link" href="/merge">Merge DOCX Files ↗</a>
   </div>
 
   <div class="main">
@@ -188,8 +191,8 @@ const MODES = {
   },
   localize_images: {
     endpoint: '/localize_images', label: 'Localize Images', suffix: '_localized',
-    busy: 'Localizing images… each image is culturally adapted.',
-    hint: 'Upload images and they will be adapted to Bangladeshi culture. Each localized image is downloaded separately.',
+    busy: 'Localizing images… reading the text, translating it, adapting the artwork.',
+    hint: 'Upload images — screenshots included. Text is read and rewritten in Bangla in its own place, logos and brand marks are left exactly as they are, and the artwork is adapted to Bangladeshi culture unless the picture is a screenshot, form or chart whose layout has to survive. Each localized image is downloaded separately.',
     acceptType: 'image/*',
   },
 };
