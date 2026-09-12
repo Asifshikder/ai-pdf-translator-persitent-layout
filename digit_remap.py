@@ -1,12 +1,12 @@
 """Digit-remap pipeline: Latin digits → Bengali digits, no AI.
 
-Runs on an already-translated PDF (one with an embedded manifest). The translation
-pipeline deliberately keeps Latin digits in the Bangla text; this pass converts
-them afterwards with a plain character map — 2025 becomes ২০২৫, 2.5mg becomes
-২.৫mg — then redraws only the pages that actually changed.
+Works on any PDF. When a translation manifest is present (a `_bn.pdf` from this
+tool), Bangla segments are redrawn from the manifest so shaped text stays
+correct. Otherwise every extractable text span that still has Latin digits is
+rewritten in place — enough for English PDFs, page numbers, and any document
+whose text extracts cleanly.
 
-Also remaps digit-only source text the translator left untouched (TOC page
-numbers, bare numerals): those still sit in the source fonts and extract cleanly.
+Examples: 2025 → ২০২৫, 2.5mg → ২.৫mg. No API calls.
 """
 
 from __future__ import annotations
@@ -29,9 +29,10 @@ DIGIT_SUFFIX = "_digits.pdf"  # keep in sync with MODES.digits.suffix in static/
 LATIN_TO_BENGALI = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
 HAS_LATIN_DIGIT = re.compile(r"[0-9]")
 
-# Source spans that are only digits / punctuation / whitespace — safe to rewrite
-# without touching bullets, checkboxes, or mixed Latin prose.
-DIGITISH = re.compile(r"^[\d\s.,:;/\-–—%+()]+$")
+# Decorative fonts carry no readable digits worth remapping.
+SYMBOL_FONT = re.compile(r"dingbat|wingding|webding|symbol", re.I)
+# Invisible copy-layer overlays must not be rewritten as visible text.
+COPY_LAYER_TAG = "CopyLayer"
 
 
 class DigitReport:
@@ -41,13 +42,15 @@ class DigitReport:
         self.pages_scanned = 0
         self.pages_changed = 0
         self.segments_remapped = 0
-        self.kept_spans_remapped = 0
+        self.spans_remapped = 0
+        self.via_manifest = False
 
     def summary(self) -> str:
+        mode = "manifest" if self.via_manifest else "text spans"
         return (
-            f"{self.pages_scanned} pages scanned, {self.pages_changed} updated | "
-            f"{self.segments_remapped} translated segments, "
-            f"{self.kept_spans_remapped} kept number spans"
+            f"{self.pages_scanned} pages scanned, {self.pages_changed} updated "
+            f"via {mode} | {self.segments_remapped} segments, "
+            f"{self.spans_remapped} spans"
         )
 
 
@@ -57,7 +60,7 @@ def remap_digits(text: str) -> str:
 
 
 def _span_css(size: float, color_int: int, bold: bool) -> str:
-    """CSS for a kept source span redrawn with the Bangla font."""
+    """CSS for a span redrawn with the Bangla font (needed for Bengali digits)."""
     return CSS_TEMPLATE.format(
         size=size,
         color=_span_color_to_css(color_int),
@@ -66,8 +69,8 @@ def _span_css(size: float, color_int: int, bold: bool) -> str:
     )
 
 
-def _kept_digit_spans(page: fitz.Page, source_fonts: set[str]) -> list[dict]:
-    """Source-font spans whose text is digit-ish and still uses Latin digits."""
+def _collect_digit_spans(page: fitz.Page) -> list[dict]:
+    """Every readable span on the page that still contains Latin digits."""
     found = []
     for block in page.get_text("dict")["blocks"]:
         if block["type"] != 0:
@@ -75,11 +78,10 @@ def _kept_digit_spans(page: fitz.Page, source_fonts: set[str]) -> list[dict]:
         for line in block["lines"]:
             for span in line["spans"]:
                 text = span["text"]
-                if span["font"] not in source_fonts:
+                if not text or not HAS_LATIN_DIGIT.search(text):
                     continue
-                if not HAS_LATIN_DIGIT.search(text):
-                    continue
-                if not DIGITISH.match(text.strip()):
+                font = span["font"]
+                if SYMBOL_FONT.search(font) or COPY_LAYER_TAG in font:
                     continue
                 found.append(
                     {
@@ -91,6 +93,34 @@ def _kept_digit_spans(page: fitz.Page, source_fonts: set[str]) -> list[dict]:
                     }
                 )
     return found
+
+
+def _remap_spans_on_page(
+    page: fitz.Page, archive: fitz.Archive, report: DigitReport
+) -> bool:
+    """Redact and redraw every span with Latin digits. Returns True if anything changed."""
+    spans = _collect_digit_spans(page)
+    if not spans:
+        return False
+
+    for span in spans:
+        page.add_redact_annot(span["bbox"] + (0.3, 0.3, -0.3, -0.3), fill=False)
+    page.apply_redactions(
+        images=fitz.PDF_REDACT_IMAGE_NONE,
+        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+    )
+
+    for span in spans:
+        remapped = remap_digits(span["text"])
+        report.spans_remapped += 1
+        page.insert_htmlbox(
+            span["bbox"],
+            html.escape(remapped),
+            css=_span_css(span["size"], span["color"], span["bold"]),
+            scale_low=0.0,
+            archive=archive,
+        )
+    return True
 
 
 def _segments_need_remap(entry: dict) -> bool:
@@ -128,93 +158,80 @@ def _redraw_segments(
         )
 
 
-def _remap_kept_spans(
-    page: fitz.Page,
-    source_fonts: set[str],
-    archive: fitz.Archive,
-    report: DigitReport,
+def _remap_via_manifest(
+    doc: fitz.Document, data: dict, archive: fitz.Archive, report: DigitReport
 ) -> None:
-    """Replace kept Latin digit spans (TOC numbers, bare numerals) in place."""
-    spans = _kept_digit_spans(page, source_fonts)
-    if not spans:
-        return
-
-    for span in spans:
-        page.add_redact_annot(span["bbox"] + (0.3, 0.3, -0.3, -0.3), fill=False)
-    page.apply_redactions(
-        images=fitz.PDF_REDACT_IMAGE_NONE,
-        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-    )
-
-    for span in spans:
-        remapped = remap_digits(span["text"])
-        report.kept_spans_remapped += 1
-        page.insert_htmlbox(
-            span["bbox"],
-            html.escape(remapped),
-            css=_span_css(span["size"], span["color"], span["bold"]),
-            scale_low=0.0,
-            archive=archive,
-        )
-
-
-def remap_pdf(pdf_bytes: bytes) -> tuple[bytes, str]:
-    """Convert Latin digits to Bengali digits in a translated PDF.
-
-    Returns the remapped PDF and a one-line summary. Pages with no Latin digits
-    are left byte-identical; the run makes no API calls.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    data = manifest.read(doc)
-
-    if data.get("fallback_collision"):
-        doc.close()
-        raise manifest.ManifestUnsupported(
-            "The source PDF uses "
-            + ", ".join(data["fallback_collision"])
-            + ", which this tool also uses for its own text. Its translated text "
-            "cannot be told apart from the original, so digits cannot be remapped."
-        )
-
-    archive = fitz.Archive(FONTS_DIR)
+    """Prefer the manifest when present: shaped Bangla cannot be read back."""
+    report.via_manifest = True
     source_fonts = set(data["source_fonts"])
     entries = {entry["page"]: entry for entry in data["pages"]}
-    report = DigitReport()
 
     for page_num, page in enumerate(doc, start=1):
         report.pages_scanned += 1
         entry = entries.get(page_num)
         segments_dirty = bool(entry and entry["segments"] and _segments_need_remap(entry))
-        kept_dirty = bool(_kept_digit_spans(page, source_fonts))
-        if not segments_dirty and not kept_dirty:
+        spans_dirty = bool(_collect_digit_spans(page))
+        if not segments_dirty and not spans_dirty:
             continue
 
-        logger.info(
-            "Page %d: remapping Latin digits (%s%s%s)",
-            page_num,
-            "segments" if segments_dirty else "",
-            " + " if segments_dirty and kept_dirty else "",
-            "kept numbers" if kept_dirty else "",
-        )
-
         if segments_dirty:
-            # Erasing takes out every inserted glyph; kept source numbers survive
-            # and are remapped next, then the whole translated layer is redrawn.
+            logger.info("Page %d: remapping Latin digits via manifest", page_num)
             _erase_inserted(page, source_fonts)
-            if kept_dirty:
-                _remap_kept_spans(page, source_fonts, archive, report)
+            if _collect_digit_spans(page):
+                _remap_spans_on_page(page, archive, report)
             _redraw_segments(page, entry, archive, report)
         else:
-            _remap_kept_spans(page, source_fonts, archive, report)
-
+            logger.info("Page %d: remapping digit spans (no segment changes)", page_num)
+            _remap_spans_on_page(page, archive, report)
         report.pages_changed += 1
 
     manifest.attach(doc, data)
-    logger.info("Digit remap done: %s", report.summary())
-
-    # No subset_fonts(): subsetting renumbers HarfBuzz glyph IDs and corrupts
-    # complex-script Bangla the same way the old translate pipeline did.
     copy_layer.blank_shaped_tounicode(doc)
+
+
+def _remap_via_spans(
+    doc: fitz.Document, archive: fitz.Archive, report: DigitReport
+) -> None:
+    """Manifest-free path: rewrite every extractable span that has Latin digits."""
+    for page_num, page in enumerate(doc, start=1):
+        report.pages_scanned += 1
+        if not _collect_digit_spans(page):
+            continue
+        logger.info("Page %d: remapping Latin digits via text spans", page_num)
+        if _remap_spans_on_page(page, archive, report):
+            report.pages_changed += 1
+
+
+def remap_pdf(pdf_bytes: bytes) -> tuple[bytes, str]:
+    """Convert Latin digits to Bengali digits in a PDF.
+
+    Uses the translation manifest when the PDF has one; otherwise remaps from
+    extractable page text. Never requires a prior Translate run.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    archive = fitz.Archive(FONTS_DIR)
+    report = DigitReport()
+
+    try:
+        data = manifest.read(doc)
+    except (manifest.ManifestMissing, manifest.ManifestUnsupported):
+        data = None
+
+    if data is not None and data.get("fallback_collision"):
+        # Manifest is unusable for erase/redraw — fall back to span remapping.
+        logger.warning(
+            "Manifest has fallback font collision (%s); remapping via text spans instead",
+            ", ".join(data["fallback_collision"]),
+        )
+        data = None
+
+    if data is not None:
+        _remap_via_manifest(doc, data, archive, report)
+    else:
+        _remap_via_spans(doc, archive, report)
+
+    logger.info("Digit remap done: %s", report.summary())
+    # No subset_fonts(): subsetting renumbers HarfBuzz glyph IDs and corrupts Bangla.
     out = doc.tobytes(garbage=3, deflate=True)
     doc.close()
     return out, report.summary()

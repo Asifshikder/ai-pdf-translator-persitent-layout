@@ -165,12 +165,10 @@ async def fix(file: UploadFile = File(...)):
 
 @app.post("/digits")
 async def digits(file: UploadFile = File(...)):
-    """Latin digits → Bengali digits on a translated PDF. No AI calls."""
+    """Latin digits → Bengali digits on any PDF. No AI calls."""
     pdf_bytes = await _read_pdf(file)
     try:
         remapped, summary = remap_pdf(pdf_bytes)
-    except (ManifestMissing, ManifestUnsupported) as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
         logger.exception("Digit remap pipeline failed")
         raise HTTPException(

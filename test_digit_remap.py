@@ -1,7 +1,7 @@
 """Tests for the digit-remap pipeline (digit_remap.py).
 
-No API calls: pure string mapping plus a tiny PDF fixture that carries a
-manifest so remap_pdf can run end-to-end.
+No API calls: pure string mapping plus tiny PDF fixtures — with and without
+a translation manifest.
 """
 
 from __future__ import annotations
@@ -18,13 +18,23 @@ def test_remap_digits_basic():
     assert remap_digits("30%") == "৩০%"
     assert remap_digits("21-35") == "২১-৩৫"
     assert remap_digits("no digits") == "no digits"
-    assert remap_digits("ইতিমধ্যে ৯৯৯") == "ইতিমধ্যে ৯৯৯"  # already Bengali
+    assert remap_digits("ইতিমধ্যে ৯৯৯") == "ইতিমধ্যে ৯৯৯"
 
 
 def test_remap_digits_idempotent():
     once = remap_digits("Take 2 tablets for 6 weeks")
     assert once == "Take ২ tablets for ৬ weeks"
     assert remap_digits(once) == once
+
+
+def _plain_pdf_with_digits(text: str = "Year 2025 — dose 2.5mg") -> bytes:
+    """Ordinary PDF with extractable Latin text (no translation manifest)."""
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=200)
+    page.insert_text((40, 80), text, fontsize=14)
+    out = doc.tobytes()
+    doc.close()
+    return out
 
 
 def _tiny_translated_pdf(bn: str = "প্রতিদিন 2 বার, 2025 সালে") -> bytes:
@@ -34,9 +44,6 @@ def _tiny_translated_pdf(bn: str = "প্রতিদিন 2 বার, 2025 �
     rect = fitz.Rect(40, 40, 260, 80)
     page.insert_htmlbox(rect, bn)
 
-    source_fonts = sorted(manifest.page_span_fonts(page))
-    # Pretend the drawn font is "inserted" Bangla by recording empty source fonts
-    # so erase will strip it; the fixture only needs the remap path to run.
     data = {
         "v": manifest.SCHEMA_VERSION,
         "tool": "pdftranslator",
@@ -71,59 +78,59 @@ def _tiny_translated_pdf(bn: str = "প্রতিদিন 2 বার, 2025 �
             }
         ],
     }
-    # Keep real source_fonts empty intentionally so _erase_inserted removes the
-    # htmlbox glyphs we just drew (their font is not in source_fonts).
-    assert source_fonts  # sanity: something was drawn
-    del source_fonts
     manifest.attach(doc, data)
     out = doc.tobytes()
     doc.close()
     return out
 
 
-def test_remap_pdf_updates_manifest_and_summary():
-    pdf_bytes = _tiny_translated_pdf()
-    out, summary = remap_pdf(pdf_bytes)
-    assert "1 pages scanned, 1 updated" in summary
-    assert "1 translated segments" in summary
+def test_remap_pdf_without_manifest():
+    """Any PDF works — no Translate step required."""
+    out, summary = remap_pdf(_plain_pdf_with_digits())
+    assert "via text spans" in summary
+    assert "1 updated" in summary
+
+    doc = fitz.open(stream=out, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+    assert "২০২৫" in text
+    assert "২.৫" in text
+    assert "2025" not in text
+
+
+def test_remap_pdf_with_manifest_updates_bn():
+    out, summary = remap_pdf(_tiny_translated_pdf())
+    assert "via manifest" in summary
+    assert "1 updated" in summary
 
     doc = fitz.open(stream=out, filetype="pdf")
     data = manifest.read(doc)
     bn = data["pages"][0]["segments"][0]["bn"]
     assert bn == "প্রতিদিন ২ বার, ২০২৫ সালে"
     assert "2" not in bn
-    assert "2025" not in bn
     doc.close()
 
 
 def test_remap_pdf_skips_when_no_latin_digits():
-    pdf_bytes = _tiny_translated_pdf("শুধু বাংলা ১২৩")
-    out, summary = remap_pdf(pdf_bytes)
-    assert "0 updated" in summary
-    assert "0 translated segments" in summary
-    # Manifest bn unchanged
-    doc = fitz.open(stream=out, filetype="pdf")
-    data = manifest.read(doc)
-    assert data["pages"][0]["segments"][0]["bn"] == "শুধু বাংলা ১২৩"
-    doc.close()
-
-
-def test_remap_pdf_rejects_missing_manifest():
+    # No Latin digits at all — pipeline should be a no-op.
     doc = fitz.open()
-    doc.new_page()
+    page = doc.new_page(width=300, height=200)
+    page.insert_text((40, 80), "Hello world — no numbers here", fontsize=14)
     raw = doc.tobytes()
     doc.close()
-    try:
-        remap_pdf(raw)
-        assert False, "expected ManifestMissing"
-    except manifest.ManifestMissing:
-        pass
+
+    out, summary = remap_pdf(raw)
+    assert "0 updated" in summary
+    assert "0 spans" in summary
+    doc = fitz.open(stream=out, filetype="pdf")
+    assert "Hello world" in doc[0].get_text()
+    doc.close()
 
 
 if __name__ == "__main__":
     test_remap_digits_basic()
     test_remap_digits_idempotent()
-    test_remap_pdf_updates_manifest_and_summary()
+    test_remap_pdf_without_manifest()
+    test_remap_pdf_with_manifest_updates_bn()
     test_remap_pdf_skips_when_no_latin_digits()
-    test_remap_pdf_rejects_missing_manifest()
     print("OK")
